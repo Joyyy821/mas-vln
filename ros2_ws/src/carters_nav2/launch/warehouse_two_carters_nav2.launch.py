@@ -1,141 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import os
+
+from ament_index_python.packages import get_package_share_directory
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node, PushRosNamespace
-from launch_ros.substitutions import FindPackageShare
-
-
-def nav2_group(robot_ns: str):
-    params_file = LaunchConfiguration("params_file")
-
-    # Per-robot overrides (important!)
-    # Isaac Sim TF frames are typically robot-scoped like robot1/base_link, robot1/odom.
-    # Nav2 nodes run in namespace robot1, so we can set frame ids to base_link/odom
-    # IF your TF frames are literally "robot1/base_link", set them explicitly below.
-    # To be robust with your current setup (you prefixed frames), we set explicit full frame ids.
-    base_link = f"{robot_ns}/base_link"
-    odom = f"{robot_ns}/odom"
-
-    # Convert PointCloud2 -> LaserScan for AMCL/costmaps
-    pcl_to_scan = Node(
-        package="pointcloud_to_laserscan",
-        executable="pointcloud_to_laserscan_node",
-        name="pointcloud_to_laserscan",
-        output="screen",
-        parameters=[{
-            "target_frame": base_link,
-            "transform_tolerance": 0.05,
-            "min_height": -0.2,
-            "max_height": 0.5,
-            "angle_min": -3.14159,
-            "angle_max": 3.14159,
-            "angle_increment": 0.0087,
-            "scan_time": 0.1,
-            "range_min": 0.2,
-            "range_max": 30.0,
-            "use_inf": True
-        }],
-        remappings=[
-            ("cloud_in", "front_3d_lidar/lidar_points"),
-            ("scan", "scan"),
-        ],
-    )
-
-    # Nav2 bringup
-    nav2_bringup = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([FindPackageShare("nav2_bringup"), "launch", "bringup_launch.py"])
-        ),
-        launch_arguments={
-            "namespace": robot_ns,
-            "use_namespace": "True",
-            "slam": "False",
-            "map": LaunchConfiguration("map_yaml"),
-            "use_sim_time": "True",
-            "params_file": params_file,
-            "autostart": "True",
-        }.items(),
-    )
-
-    # Override frame ids for AMCL + costmaps + BT, etc.
-    # This is done by launching small parameter override nodes is messy; instead we rely on
-    # nav2 params having base_link/odom placeholders AND we set them via a param rewrite approach
-    # in a future iteration. For now, simplest: keep frames in params as base_link/odom and ensure
-    # TF frames are base_link/odom inside namespace.
-    #
-    # If your TF frames are robot1/base_link (not base_link), then you must set params accordingly.
-    # We already set base_frame_id/odom_frame_id in the YAML, but they were 'base_link'/'odom'.
-    # We'll inject overrides by launching amcl + nav2 nodes through bringup with rewritten params
-    # in a later refinement if needed.
-    #
-    # Practical workaround: set your Isaac Sim TF frames to base_link/odom inside each namespace
-    # OR update nav2_params.yaml to full frames and keep this consistent.
-    #
-    # Given your earlier frame-prefix patch, you likely have robot1/base_link etc.
-    # So: set those explicitly via param overrides by using `param_substitutions` is not supported
-    # directly here, so easiest is: run with frames as full ids in yaml.
-    #
-    # To keep this launch self-contained, we add a per-robot param override for AMCL only:
-    amcl_override = Node(
-        package="nav2_amcl",
-        executable="amcl",
-        name="amcl_override",
-        output="screen",
-        parameters=[params_file, {
-            "base_frame_id": base_link,
-            "odom_frame_id": odom,
-            "global_frame_id": "map",
-            "scan_topic": "scan",
-            "use_sim_time": True,
-        }],
-        # amcl launched by bringup too; so we do NOT actually start this by default.
-        # Keep disabled unless you choose to bypass bringup's amcl.
-        condition=None,
-    )
-
-    return GroupAction([
-        PushRosNamespace(robot_ns),
-        pcl_to_scan,
-        nav2_bringup,
-    ])
+from launch.substitutions import LaunchConfiguration, TextSubstitution
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    return LaunchDescription([
-        DeclareLaunchArgument(
-            "map_yaml",
-            description="Path to the map YAML for the Simple Warehouse",
-        ),
-        DeclareLaunchArgument(
-            "params_file",
-            default_value=PathJoinSubstitution([FindPackageShare("carters_nav2"), "config", "nav2_params.yaml"]),
-            description="Nav2 parameters file",
-        ),
+    # Get the launch and rviz directories
+    carter_nav2_bringup_dir = get_package_share_directory("carters_nav2")
 
-        # Global map server (shared map topic)
-        Node(
-            package="nav2_map_server",
-            executable="map_server",
-            name="map_server",
-            output="screen",
-            parameters=[{
-                "use_sim_time": True,
-                "yaml_filename": LaunchConfiguration("map_yaml"),
-            }],
-        ),
-        Node(
-            package="nav2_lifecycle_manager",
-            executable="lifecycle_manager",
-            name="lifecycle_manager_map",
-            output="screen",
-            parameters=[{
-                "use_sim_time": True,
-                "autostart": True,
-                "node_names": ["map_server"],
-            }],
-        ),
+    nav2_bringup_dir = get_package_share_directory("nav2_bringup")
+    nav2_bringup_launch_dir = os.path.join(nav2_bringup_dir, "launch")
 
-        nav2_group("robot1"),
-        nav2_group("robot2"),
-    ])
+    rviz_config_dir = os.path.join(carter_nav2_bringup_dir, "rviz2", "carter_navigation_namespaced.rviz")
+
+    # Names and poses of the robots
+    robots = [{"name": "robot1"}, {"name": "robot2"}]
+
+    # Common settings
+    ENV_MAP_FILE = "carter_warehouse_navigation.yaml"
+    use_sim_time = LaunchConfiguration("use_sim_time", default="True")
+    map_yaml_file = LaunchConfiguration("map")
+    default_bt_xml_filename = LaunchConfiguration("default_bt_xml_filename")
+    autostart = LaunchConfiguration("autostart")
+    rviz_config_file = LaunchConfiguration("rviz_config")
+    use_rviz = LaunchConfiguration("use_rviz")
+
+    # Declare the launch arguments
+    declare_map_yaml_cmd = DeclareLaunchArgument(
+        "map",
+        default_value=os.path.join(carter_nav2_bringup_dir, "maps", ENV_MAP_FILE),
+        description="Full path to map file to load",
+    )
+
+    declare_robot1_params_file_cmd = DeclareLaunchArgument(
+        "robot1_params_file",
+        default_value=os.path.join(
+            carter_nav2_bringup_dir, "config", "warehouse", "multi_robot_carter_navigation_params_1.yaml"
+        ),
+        description="Full path to the ROS2 parameters file to use for robot1 launched nodes",
+    )
+
+    declare_robot2_params_file_cmd = DeclareLaunchArgument(
+        "robot2_params_file",
+        default_value=os.path.join(
+            carter_nav2_bringup_dir, "config", "warehouse", "multi_robot_carter_navigation_params_2.yaml"
+        ),
+        description="Full path to the ROS2 parameters file to use for robot2 launched nodes",
+    )
+
+    declare_bt_xml_cmd = DeclareLaunchArgument(
+        "default_bt_xml_filename",
+        default_value=os.path.join(
+            get_package_share_directory("nav2_bt_navigator"), "behavior_trees", "navigate_w_replanning_and_recovery.xml"
+        ),
+        description="Full path to the behavior tree xml file to use",
+    )
+
+    declare_autostart_cmd = DeclareLaunchArgument(
+        "autostart", default_value="True", description="Automatically startup the stacks"
+    )
+
+    declare_rviz_config_file_cmd = DeclareLaunchArgument(
+        "rviz_config", default_value=rviz_config_dir, description="Full path to the RVIZ config file to use."
+    )
+
+    declare_use_rviz_cmd = DeclareLaunchArgument("use_rviz", default_value="True", description="Whether to start RVIZ")
+    # Define commands for launching the navigation instances
+    nav_instances_cmds = []
+    for robot in robots:
+        params_file = LaunchConfiguration(robot["name"] + "_params_file")
+
+        group = GroupAction(
+            [
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(os.path.join(nav2_bringup_launch_dir, "rviz_launch.py")),
+                    condition=IfCondition(use_rviz),
+                    launch_arguments={
+                        "namespace": TextSubstitution(text=robot["name"]),
+                        "use_namespace": "True",
+                        "rviz_config": rviz_config_file,
+                    }.items(),
+                ),
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(carter_nav2_bringup_dir, "launch", "carter_navigation_individual.launch.py")
+                    ),
+                    launch_arguments={
+                        "namespace": robot["name"],
+                        "use_namespace": "True",
+                        "map": map_yaml_file,
+                        "use_sim_time": use_sim_time,
+                        "use_composition": "False",
+                        "params_file": params_file,
+                        "default_bt_xml_filename": default_bt_xml_filename,
+                        "autostart": autostart,
+                        "use_rviz": "False",
+                        "use_simulator": "False",
+                        "headless": "False",
+                    }.items(),
+                ),
+                
+                Node(
+                    package='pointcloud_to_laserscan', executable='pointcloud_to_laserscan_node',
+                    remappings=[('cloud_in', ['front_3d_lidar/lidar_points']),
+                                ('scan', ['scan'])],
+                    parameters=[{
+                        'target_frame': 'front_3d_lidar',
+                        'transform_tolerance': 0.01,
+                        'min_height': -0.4,
+                        'max_height': 1.5,
+                        'angle_min': -1.5708,  # -M_PI/2
+                        'angle_max': 1.5708,  # M_PI/2
+                        'angle_increment': 0.0087,  # M_PI/360.0
+                        'scan_time': 0.3333,
+                        'range_min': 0.05,
+                        'range_max': 100.0,
+                        'use_inf': True,
+                        'inf_epsilon': 1.0,
+                        # 'concurrency_level': 1,
+                    }],
+                    name='pointcloud_to_laserscan',
+                    namespace = robot["name"]
+                ),
+            ]
+        )
+
+        nav_instances_cmds.append(group)
+
+    # Create the launch description and populate
+    ld = LaunchDescription()
+
+    # Declare the launch options
+
+    ld.add_action(declare_map_yaml_cmd)
+
+    ld.add_action(declare_robot1_params_file_cmd)
+    ld.add_action(declare_robot2_params_file_cmd)
+
+    ld.add_action(declare_bt_xml_cmd)
+    ld.add_action(declare_use_rviz_cmd)
+    ld.add_action(declare_autostart_cmd)
+    ld.add_action(declare_rviz_config_file_cmd)
+
+    for simulation_instance_cmd in nav_instances_cmds:
+        ld.add_action(simulation_instance_cmd)
+
+    return ld

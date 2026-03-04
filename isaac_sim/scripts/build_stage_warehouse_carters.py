@@ -32,7 +32,7 @@ STANDALONE = True
 # )
 
 # "relative" path for env and nova carter usd (to get assets root dynamically)
-ENV_USD_REL = "/Isaac/Environments/Simple_Warehouse/warehouse.usd"
+ENV_USD_REL = "/Isaac/Environments/Simple_Warehouse/warehouse_with_forklifts.usd"
 NOVA_CARTER_ROS_USD_REL = "/Isaac/Samples/ROS2/Robots/Nova_Carter_ROS.usd"
 
 OUTPUT_USD = os.environ.get("OUTPUT_USD", "")  # optional
@@ -106,9 +106,9 @@ def _set_xform_pose(prim_path: str, position_xyz: Tuple[float, float, float], ya
     xformable.ClearXformOpOrder()
     op = xformable.AddTransformOp()
 
+    # SetTranslate() clears rotation on Gf.Matrix4d, so compose both in one call.
     mat = Gf.Matrix4d(1.0)
-    mat.SetRotate(rot)
-    mat.SetTranslate(Gf.Vec3d(x, y, z))
+    mat.SetTransform(rot, Gf.Vec3d(x, y, z))
     op.Set(mat)
 
 
@@ -154,12 +154,13 @@ def _prefix_frame(frame: str, ns: str) -> str:
         return frame
     return f"{ns}/{frame}"
 
-def _fix_ros2_graph_under(root_prim_path: str, namespace: str, prefix_frames: bool = True):
+def _fix_ros2_graph_under(root_prim_path: str, namespace: str, prefix_frames: bool = False):
     """
     Robust multi-robot patch:
       - inputs:nodeNamespace <- namespace
       - inputs:topicName: strip leading '/' so namespace can apply
-      - frame ids: prefix with 'namespace/' to avoid collisions
+        (except /clock, which must remain global for ROS time)
+      - frame ids: optionally prefix with 'namespace/' when a stack requires unique TF ids
     """
     import omni.usd
 
@@ -204,8 +205,11 @@ def _fix_ros2_graph_under(root_prim_path: str, namespace: str, prefix_frames: bo
             try:
                 t = topic_attr.Get()
                 if isinstance(t, str) and t.startswith("/"):
-                    topic_attr.Set(t.lstrip("/"))
-                    touched["topicName"] += 1
+                    # Keep /clock global so all Nav2 nodes using use_sim_time
+                    # receive ROS time from Isaac Sim.
+                    if t != "/clock":
+                        topic_attr.Set(t.lstrip("/"))
+                        touched["topicName"] += 1
             except Exception:
                 pass        
 
@@ -227,6 +231,38 @@ def _fix_ros2_graph_under(root_prim_path: str, namespace: str, prefix_frames: bo
                     pass
 
     print(f"[OK] Patched ROS2 graph under {root_prim_path}: {touched}")
+
+
+def _ensure_global_ros2_clock_graph(clock_topic: str = "/clock"):
+    """
+    Create a global ROS2 clock publisher graph:
+      OnPlaybackTick -> ROS2PublishClock(timeStamp <- IsaacReadSimulationTime)
+    """
+    import omni.graph.core as og
+
+    graph_path = "/World/ROS2ClockGraph"
+
+    try:
+        og.Controller.edit(
+            {"graph_path": graph_path, "evaluator_name": "execution"},
+            {
+                og.Controller.Keys.CREATE_NODES: [
+                    ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                    ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
+                ],
+                og.Controller.Keys.CONNECT: [
+                    ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+                    ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+                ],
+                og.Controller.Keys.SET_VALUES: [
+                    ("PublishClock.inputs:topicName", clock_topic),
+                ],
+            },
+        )
+        print(f"[OK] Added global ROS2 clock publisher graph at {graph_path} on topic '{clock_topic}'")
+    except Exception as e:
+        print(f"[WARN] Failed to create ROS2 clock graph at {graph_path}: {e}")
 
 
 # Old robot namspacing approach: only set nodeNamespace, 
@@ -375,8 +411,11 @@ def build_stage():
     # This leverages the ROS2 bridge 'inputs:nodeNamespace' field (e.g., SubscribeTwist has it).
     # _set_ros2_node_namespace_under(r1, "robot1")
     # _set_ros2_node_namespace_under(r2, "robot2")
-    _fix_ros2_graph_under(r1, "robot1", prefix_frames=True)
-    _fix_ros2_graph_under(r2, "robot2", prefix_frames=True)
+    # Match Isaac Sim's multi-robot Nav2 example: namespace ROS topics per robot,
+    # but keep TF frame ids as the asset defaults (map / odom / base_link / sensor frames).
+    _fix_ros2_graph_under(r1, "robot1", prefix_frames=False)
+    _fix_ros2_graph_under(r2, "robot2", prefix_frames=False)
+    _ensure_global_ros2_clock_graph("/clock")
 
     # 4) Save (optional)
     if OUTPUT_USD:
