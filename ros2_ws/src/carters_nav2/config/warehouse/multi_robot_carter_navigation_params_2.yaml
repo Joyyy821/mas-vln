@@ -240,6 +240,7 @@ local_costmap:
           obstacle_min_range: 0.0
           raytrace_max_range: 20.0
           raytrace_min_range: 0.0
+          observation_persistence: 0.0
           clearing: True
           marking: True
           data_type: "PointCloud2"
@@ -250,6 +251,11 @@ local_costmap:
         scan:
           topic: /robot2/front_2d_lidar/scan
           max_obstacle_height: 2.0
+          obstacle_max_range: 20.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 20.0
+          raytrace_min_range: 0.0
+          observation_persistence: 0.0
           clearing: True
           marking: True
           data_type: "LaserScan"
@@ -260,6 +266,11 @@ local_costmap:
         scan:
           topic: /robot2/back_2d_lidar/scan
           max_obstacle_height: 2.0
+          obstacle_max_range: 20.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 20.0
+          raytrace_min_range: 0.0
+          observation_persistence: 0.0
           clearing: True
           marking: True
           data_type: "LaserScan"
@@ -300,6 +311,7 @@ global_costmap:
           raytrace_min_range: 0.0
           obstacle_max_range: 20.0
           obstacle_min_range: 0.0
+          observation_persistence: 0.0
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True

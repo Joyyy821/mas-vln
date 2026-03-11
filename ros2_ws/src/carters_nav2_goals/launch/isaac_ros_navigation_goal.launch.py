@@ -36,16 +36,13 @@ def generate_launch_description():
 
     navigation_goal_node = Node(
         name="set_navigation_goal",
-        package="carters_nav2",
+        package="carters_nav2_goals",
         executable="SetNavigationGoal",
         namespace="robot1",
         parameters=[
             {
                 "map_yaml_path": map_yaml_file,
-                "iteration_count": 3,
                 "action_server_name": "navigate_to_pose",
-                "obstacle_search_distance_in_meters": 0.2,
-                # "goal_text_file_path": goal_text_file,
                 "initial_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.99, 0.02],
             }
         ],
@@ -54,16 +51,13 @@ def generate_launch_description():
 
     navigation_goal_node_2 = Node(
         name="set_navigation_goal",
-        package="carters_nav2",
+        package="carters_nav2_goals",
         executable="SetNavigationGoal",
         namespace="robot2",
         parameters=[
             {
                 "map_yaml_path": map_yaml_file,
-                "iteration_count": 3,
                 "action_server_name": "navigate_to_pose",
-                "obstacle_search_distance_in_meters": 0.2,
-                # "goal_text_file_path": goal_text_file,
                 "initial_pose": [4.0, -1.0, 0.0, 0.0, 0.0, 0.99, 0.02],
             }
         ],

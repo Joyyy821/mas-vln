@@ -29,23 +29,15 @@ class SetNavigationGoal(Node):
         self.declare_parameters(
             namespace="",
             parameters=[
-                ("iteration_count", 1),
-                # ("goal_generator_type", "RandomGoalGenerator"),
                 ("action_server_name", "navigate_to_pose"),
-                ("obstacle_search_distance_in_meters", 0.2),
                 ("frame_id", "map"),
                 ("map_yaml_path", rclpy.Parameter.Type.STRING),
-                ("goal_text_file_path", rclpy.Parameter.Type.STRING),
                 ("initial_pose", rclpy.Parameter.Type.DOUBLE_ARRAY),
             ],
         )
 
         action_server_name = self.get_parameter("action_server_name").value
         self._action_client = ActionClient(self, NavigateToPose, action_server_name)
-
-        self.MAX_ITERATION_COUNT = self.get_parameter("iteration_count").value
-        assert self.MAX_ITERATION_COUNT > 0
-        self.curr_iteration_count = 1
 
         self.__initial_goal_publisher = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 1)
 
@@ -70,7 +62,7 @@ class SetNavigationGoal(Node):
         goal.pose.pose.orientation.w = self.__initial_pose[6]
         self.__initial_goal_publisher.publish(goal)
 
-    def send_goal(self):
+    def send_goal(self, goal_array=None):
         """
         Sends the goal to the action server.
         """
@@ -87,11 +79,11 @@ class SetNavigationGoal(Node):
             self.get_logger().info("Sending first goal")
 
         self._action_client.wait_for_server()
-        goal_msg = self.__get_goal()
-
-        if goal_msg is None:
+        if goal_array is None:
             rclpy.shutdown()
             sys.exit(1)
+
+        goal_msg = self.__format_goal_msg(goal_array)
 
         self._send_goal_future = self._action_client.send_goal_async(
             goal_msg, feedback_callback=self.__feedback_callback
@@ -115,12 +107,20 @@ class SetNavigationGoal(Node):
         self._get_result_future = goal_handle.get_result_async()
         self._get_result_future.add_done_callback(self.__get_result_callback)
 
-    def __get_goal(self):
+    def __format_goal_msg(self, pose):
         """
-        Get the next goal from the goal generator.
+        Format the goal message from the provided goal array (pose).
+
+        Parameters
+        ----------
+        pose : list
+            List containing the goal coordinates and orientation.
 
         Returns
         -------
+        NavigateToPose.Goal
+            Formatted goal message.
+
         [NavigateToPose][goal] or None if the next goal couldn't be generated.
 
         """
@@ -128,30 +128,17 @@ class SetNavigationGoal(Node):
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = self.get_parameter("frame_id").value
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-        pose = self.__goal_generator.generate_goal()
 
-        # couldn't sample a pose which is not close to obstacles. Rare but might happen in dense maps.
-        if pose is None:
-            self.get_logger().error(
-                "Could not generate next goal. Returning. Possible reasons for this error could be:"
-            )
-            self.get_logger().error(
-                "1. If you are using GoalReader then please make sure iteration count <= number of goals avaiable in file."
-            )
-            self.get_logger().error(
-                "2. If RandomGoalGenerator is being used then it was not able to sample a pose which is given distance away from the obstacles."
-            )
-            return
-
-        self.get_logger().info("Generated goal pose: {0}".format(pose))
+        self.get_logger().info("Goal pose: {0}".format(pose))
         goal_msg.pose.pose.position.x = pose[0]
         goal_msg.pose.pose.position.y = pose[1]
-        goal_msg.pose.pose.orientation.x = pose[2]
-        goal_msg.pose.pose.orientation.y = pose[3]
-        goal_msg.pose.pose.orientation.z = pose[4]
-        goal_msg.pose.pose.orientation.w = pose[5]
+        goal_msg.pose.pose.position.z = pose[2]
+        goal_msg.pose.pose.orientation.x = pose[3]
+        goal_msg.pose.pose.orientation.y = pose[4]
+        goal_msg.pose.pose.orientation.z = pose[5]
+        goal_msg.pose.pose.orientation.w = pose[6]
         return goal_msg
-
+    
     def __get_result_callback(self, future):
         """
         Callback to check result.\n
@@ -161,11 +148,7 @@ class SetNavigationGoal(Node):
         result = future.result().result
         self.get_logger().info("Result: {0}".format(result))
 
-        if self.curr_iteration_count < self.MAX_ITERATION_COUNT:
-            self.curr_iteration_count += 1
-            self.send_goal()
-        else:
-            rclpy.shutdown()
+        rclpy.shutdown()
 
     def __feedback_callback(self, feedback_msg):
         """
@@ -176,10 +159,34 @@ class SetNavigationGoal(Node):
 
 
 def main():
+    # Examples from goals.txt
+    pose1 = [1.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    pose2 = [2.0, 3.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    pose3 = [3.4, 4.5, 0.0, 0.5, 0.5, 0.5, 0.5]
+
     rclpy.init()
     set_goal = SetNavigationGoal()
-    result = set_goal.send_goal()
+
+    # simple test: send different goal to different robot (identify by namespace)
+    ns = set_goal.get_namespace()
+    set_goal.get_logger().info(f"Running in namespace: {ns}")
+    if ns == "/robot1":
+        goal_pose = pose1
+    elif ns == "/robot2":
+        goal_pose = pose2
+    
+    # send goal
+    result = set_goal.send_goal(goal_pose)
     rclpy.spin(set_goal)
+    # try:
+    #     result = set_goal.send_goal(goal_pose)
+    #     rclpy.spin(set_goal)
+    # except KeyboardInterrupt:
+    #     set_goal.get_logger().info('Interrupted by user.')
+    # finally:
+    #     set_goal.get_logger().info('Exiting...')
+    #     set_goal.destroy_node()
+    #     rclpy.shutdown()
 
 
 if __name__ == "__main__":

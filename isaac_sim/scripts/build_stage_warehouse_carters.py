@@ -452,4 +452,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # usage (tested on ubuntu 22.04 with ROS 2 Humble and Isaac Sim 5.1):
+    # $ cd isaac-sim # Note: your isaac sim installation dir, not this script's dir
+    # $ conda deactivate  # (optional) ensure base conda env is not active, to avoid conflicts with ROS 2 Humble's Python 3.10
+    # $ source /opt/ros/humble/setup.bash  # source ROS 2 Humble setup to enable ROS2 bridge
+    # $ ./python.sh /abs/path/to/mas-vln/isaac_sim/scripts/build_stage_warehouse_carters.py
     main()
