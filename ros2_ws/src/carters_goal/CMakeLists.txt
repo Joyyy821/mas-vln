@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(carters_nav2_goals LANGUAGES PYTHON)
+project(carters_goal LANGUAGES PYTHON)
 
 # Default to C++17
 if(NOT CMAKE_CXX_STANDARD)
@@ -27,7 +27,11 @@ ament_python_install_package(${PROJECT_NAME})
 
 # Install Python executables
 install(PROGRAMS
-  carters_nav2_goals/set_goal.py
+  carters_goal/set_goal.py
+  carters_goal/mapf_goal_publisher.py
+  carters_goal/mapf_nav2_executor.py
+  carters_goal/namespaced_tf_bridge.py
+  carters_goal/initial_pose_tf_publisher.py
   DESTINATION lib/${PROJECT_NAME}
   )
 

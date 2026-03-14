@@ -36,7 +36,7 @@ def generate_launch_description():
 
     navigation_goal_node = Node(
         name="set_navigation_goal",
-        package="carters_nav2_goals",
+        package="carters_goal",
         executable="SetNavigationGoal",
         namespace="robot1",
         parameters=[
@@ -51,7 +51,7 @@ def generate_launch_description():
 
     navigation_goal_node_2 = Node(
         name="set_navigation_goal",
-        package="carters_nav2_goals",
+        package="carters_goal",
         executable="SetNavigationGoal",
         namespace="robot2",
         parameters=[
@@ -66,6 +66,6 @@ def generate_launch_description():
 
     # return LaunchDescription([navigation_goal_node])
     return LaunchDescription([
-    navigation_goal_node,
-    navigation_goal_node_2
-])
+        navigation_goal_node,
+        navigation_goal_node_2
+    ])

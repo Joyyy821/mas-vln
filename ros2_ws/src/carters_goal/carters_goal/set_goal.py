@@ -124,7 +124,6 @@ class SetNavigationGoal(Node):
         [NavigateToPose][goal] or None if the next goal couldn't be generated.
 
         """
-
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = self.get_parameter("frame_id").value
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
@@ -138,7 +137,7 @@ class SetNavigationGoal(Node):
         goal_msg.pose.pose.orientation.z = pose[5]
         goal_msg.pose.pose.orientation.w = pose[6]
         return goal_msg
-    
+
     def __get_result_callback(self, future):
         """
         Callback to check result.\n
@@ -174,7 +173,7 @@ def main():
         goal_pose = pose1
     elif ns == "/robot2":
         goal_pose = pose2
-    
+
     # send goal
     result = set_goal.send_goal(goal_pose)
     rclpy.spin(set_goal)

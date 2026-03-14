@@ -1,0 +1,13 @@
+initial_pose_tf_publisher:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    odom_frame: odom
+    robot_namespaces: ["robot1", "robot2"]
+
+    # Spawn poses from isaac_sim/scripts/build_stage_warehouse_carters.py.
+    initial_poses:
+      [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        2.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+      ]

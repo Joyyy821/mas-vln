@@ -1,0 +1,58 @@
+mapf_base:
+  map_server:
+    ros__parameters:
+      use_sim_time: true
+
+  mapf_base_node:
+    ros__parameters:
+      use_sim_time: true
+      agent_num: 2
+      global_frame_id: map
+
+      # For offline trajectory generation, allow long solving time.
+      planner_time_tolerance: 120.0
+      goal_tolerance: 0.5
+      continuous_planning: false
+
+      ecbs:
+        suboptimality: 1.2
+
+      # Unified TF tree published by NamespacedTfBridge.
+      base_frame_id:
+        agent_0: robot1/base_link
+        agent_1: robot2/base_link
+
+      plan_topic:
+        agent_0: robot1/plan
+        agent_1: robot2/plan
+
+  goal_transformer:
+    ros__parameters:
+      use_sim_time: true
+      agent_num: 2
+      goal_for_each_topic: goal_for_each
+
+      # Legacy per-agent topics are still accepted by goal_transformer.
+      goal_topic:
+        agent_0: robot1/goal
+        agent_1: robot2/goal
+
+  plan_executor:
+    ros__parameters:
+      use_sim_time: true
+      xy_goal_tolerance: 0.2
+      yaw_goal_tolerance: 0.2
+      agent_num: 2
+      global_frame_id: map
+
+      agent_name:
+        agent_0: robot1
+        agent_1: robot2
+
+      base_frame_id:
+        agent_0: robot1/base_link
+        agent_1: robot2/base_link
+
+      plan_topic:
+        agent_0: robot1/plan
+        agent_1: robot2/plan

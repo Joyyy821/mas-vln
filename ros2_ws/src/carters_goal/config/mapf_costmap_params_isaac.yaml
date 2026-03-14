@@ -1,0 +1,19 @@
+mapf_base:
+  mapf_costmap:
+    mapf_costmap:
+      ros__parameters:
+        use_sim_time: true
+        update_frequency: 1.0
+        publish_frequency: 1.0
+
+        global_frame: map
+        robot_base_frame: robot1/base_link
+
+        track_unknown_space: true
+        plugins: ["static_layer"]
+
+        static_layer:
+          plugin: "nav2_costmap_2d::StaticLayer"
+          map_subscribe_transient_local: true
+
+        always_send_full_costmap: true
