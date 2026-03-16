@@ -12,6 +12,18 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+############################################################################
+#### Launch warehouse MAPF demo with nav2 path follower: ###################
+# 1. Start Isaac Sim on host machine (source ros2 environment first to enable ros2 bridge)
+# $ cd ~/isaac_sim
+# $ ./python.sh /path/to/mas-vln/isaac_sim/scripts/build_stage_warehouse_carters.py
+# 2. Launch caters nav2 example in Isaac ROS docker (source ros2 and ros2_ws)
+# $ ros2 launch carters_nav2 warehouse_two_carters_nav2.launch.py
+# 3. In another terminal, launch this MAPF demo (source ros2 and ros2_ws)
+# $ ros2 launch carters_goal isaac_ros_mapf.launch.py run_plan_executor:=true
+############################################################################
+
+
 def generate_launch_description():
     carters_nav2_dir = get_package_share_directory("carters_nav2")
     carters_goal_dir = get_package_share_directory("carters_goal")
@@ -182,9 +194,11 @@ def generate_launch_description():
                         "goal_topic": "/mapf_base/goal_for_each",
                         "goal_init_topic": "/mapf_base/goal_init_flag",
                         "global_plan_topic": "/mapf_base/global_plan",
+                        "mapf_transition_topic": "/mapf_base/mapf_base_node/transition_event",
                         "frame_id": "map",
                         "publish_count": 0,
                         "wait_for_subscribers": True,
+                        "wait_for_mapf_active": True,
                         "stop_on_plan": True,
                     }
                 ],

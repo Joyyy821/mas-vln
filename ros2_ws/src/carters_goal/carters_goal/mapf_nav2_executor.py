@@ -225,8 +225,13 @@ class MapfNav2Executor(Node):
             pose_copy.header.frame_id = self._global_frame_id
             pose_copy.header.stamp = path.header.stamp
 
-            yaw = self._compute_heading(compact_poses, idx)
-            pose_copy.pose.orientation = self._yaw_to_quaternion(yaw)
+            if idx == len(compact_poses) - 1:
+                pose_copy.pose.orientation = self._normalize_quaternion(
+                    compact_poses[idx].pose.orientation
+                )
+            else:
+                yaw = self._compute_heading(compact_poses, idx)
+                pose_copy.pose.orientation = self._yaw_to_quaternion(yaw)
             path.poses.append(pose_copy)
 
         return path
@@ -271,6 +276,24 @@ class MapfNav2Executor(Node):
         quat.z = math.sin(yaw / 2.0)
         quat.w = math.cos(yaw / 2.0)
         return quat
+
+    def _normalize_quaternion(self, quat_in: Quaternion) -> Quaternion:
+        norm = math.sqrt(
+            quat_in.x * quat_in.x
+            + quat_in.y * quat_in.y
+            + quat_in.z * quat_in.z
+            + quat_in.w * quat_in.w
+        )
+        quat_out = Quaternion()
+        if norm < 1e-8:
+            quat_out.w = 1.0
+            return quat_out
+
+        quat_out.x = quat_in.x / norm
+        quat_out.y = quat_in.y / norm
+        quat_out.z = quat_in.z / norm
+        quat_out.w = quat_in.w / norm
+        return quat_out
 
     def _squared_distance(self, x0: float, y0: float, x1: float, y1: float) -> float:
         return (x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)

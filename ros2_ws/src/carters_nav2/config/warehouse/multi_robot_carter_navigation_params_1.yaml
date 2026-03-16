@@ -151,7 +151,7 @@ controller_server:
     stopped_goal_checker:
       plugin: "nav2_controller::StoppedGoalChecker"
       xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.05   # 0.25
       stateful: True
     # DWB parameters
     FollowPath:

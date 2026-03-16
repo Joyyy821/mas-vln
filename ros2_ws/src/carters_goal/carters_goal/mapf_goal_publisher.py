@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import math
 from typing import List
 
 import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import PoseArray, Pose
+from lifecycle_msgs.msg import TransitionEvent
 from std_msgs.msg import Bool
 from mapf_msgs.msg import GlobalPlan
 
@@ -24,8 +26,12 @@ class MapfGoalPublisher(Node):
         self.declare_parameter("publish_count", 5)
         self.declare_parameter("agent_num", len(default_goals))
         self.declare_parameter("wait_for_subscribers", True)
+        self.declare_parameter("wait_for_mapf_active", True)
         self.declare_parameter("stop_on_plan", True)
         self.declare_parameter("global_plan_topic", "/mapf_base/global_plan")
+        self.declare_parameter(
+            "mapf_transition_topic", "/mapf_base/mapf_base_node/transition_event"
+        )
 
         flat_default = [value for goal in default_goals for value in goal]
         self.declare_parameter("goal_array", flat_default)
@@ -36,8 +42,10 @@ class MapfGoalPublisher(Node):
         self._publish_count = int(self.get_parameter("publish_count").value)
         self._agent_num = int(self.get_parameter("agent_num").value)
         self._wait_for_subscribers = bool(self.get_parameter("wait_for_subscribers").value)
+        self._wait_for_mapf_active = bool(self.get_parameter("wait_for_mapf_active").value)
         self._stop_on_plan = bool(self.get_parameter("stop_on_plan").value)
         self._global_plan_topic = self.get_parameter("global_plan_topic").value
+        self._mapf_transition_topic = self.get_parameter("mapf_transition_topic").value
 
         period = float(self.get_parameter("publish_period_sec").value)
         flat_goal_array = list(self.get_parameter("goal_array").value)
@@ -49,7 +57,9 @@ class MapfGoalPublisher(Node):
         self._goal_pub = self.create_publisher(PoseArray, self._goal_topic, 1)
         self._goal_init_pub = self.create_publisher(Bool, self._goal_init_topic, 1)
         self._plan_sub = None
+        self._transition_sub = None
         self._plan_received = False
+        self._mapf_is_active = not self._wait_for_mapf_active
 
         if self._stop_on_plan:
             self._plan_sub = self.create_subscription(
@@ -58,9 +68,17 @@ class MapfGoalPublisher(Node):
                 self._global_plan_callback,
                 1,
             )
+        if self._wait_for_mapf_active:
+            self._transition_sub = self.create_subscription(
+                TransitionEvent,
+                self._mapf_transition_topic,
+                self._transition_callback,
+                1,
+            )
 
         self._publish_idx = 0
         self._waiting_logged = False
+        self._waiting_for_active_logged = False
         self._timer = self.create_timer(period, self._timer_callback)
 
     def _build_pose_array(self, flat_goal_array: List[float]) -> PoseArray:
@@ -81,13 +99,39 @@ class MapfGoalPublisher(Node):
             pose.position.x = float(flat_goal_array[base])
             pose.position.y = float(flat_goal_array[base + 1])
             pose.position.z = float(flat_goal_array[base + 2])
-            pose.orientation.x = float(flat_goal_array[base + 3])
-            pose.orientation.y = float(flat_goal_array[base + 4])
-            pose.orientation.z = float(flat_goal_array[base + 5])
-            pose.orientation.w = float(flat_goal_array[base + 6])
+            quat = self._normalize_quaternion(
+                float(flat_goal_array[base + 3]),
+                float(flat_goal_array[base + 4]),
+                float(flat_goal_array[base + 5]),
+                float(flat_goal_array[base + 6]),
+                i,
+            )
+            pose.orientation.x = quat[0]
+            pose.orientation.y = quat[1]
+            pose.orientation.z = quat[2]
+            pose.orientation.w = quat[3]
             pose_array.poses.append(pose)
 
         return pose_array
+
+    def _normalize_quaternion(
+        self, x: float, y: float, z: float, w: float, agent_idx: int
+    ) -> List[float]:
+        norm = math.sqrt(x * x + y * y + z * z + w * w)
+        if norm < 1e-8:
+            self.get_logger().warn(
+                f"Agent {agent_idx} goal quaternion has near-zero norm. "
+                "Using identity orientation."
+            )
+            return [0.0, 0.0, 0.0, 1.0]
+
+        if abs(norm - 1.0) > 1e-3:
+            self.get_logger().warn(
+                f"Agent {agent_idx} goal quaternion is not normalized "
+                f"(norm={norm:.6f}). Normalizing it."
+            )
+
+        return [x / norm, y / norm, z / norm, w / norm]
 
     def _global_plan_callback(self, plan_msg: GlobalPlan) -> None:
         if plan_msg.global_plan:
@@ -95,7 +139,25 @@ class MapfGoalPublisher(Node):
             self.get_logger().info("Received /global_plan. Stopping goal initialization publisher.")
             self._timer.cancel()
 
+    def _transition_callback(self, event: TransitionEvent) -> None:
+        goal_label = event.goal_state.label.lower()
+        if goal_label == "active":
+            self._mapf_is_active = True
+            return
+
+        if goal_label in {"inactive", "unconfigured", "finalized"}:
+            self._mapf_is_active = False
+
     def _timer_callback(self) -> None:
+        if self._wait_for_mapf_active and not self._mapf_is_active:
+            if not self._waiting_for_active_logged:
+                self.get_logger().info(
+                    "Waiting for /mapf_base/mapf_base_node to become active before publishing goals."
+                )
+                self._waiting_for_active_logged = True
+            return
+        self._waiting_for_active_logged = False
+
         if self._wait_for_subscribers:
             goal_sub_count = self._goal_pub.get_subscription_count()
             init_sub_count = self._goal_init_pub.get_subscription_count()
@@ -128,7 +190,7 @@ class MapfGoalPublisher(Node):
 def main() -> None:
     example_goals = [
         [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        [2.0, 3.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+        [2.0, 3.0, 0.0, 0.0, 0.0, 0.70710678, 0.70710678],
     ]
 
     rclpy.init()
