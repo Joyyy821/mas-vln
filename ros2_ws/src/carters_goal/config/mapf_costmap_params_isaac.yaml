@@ -7,6 +7,7 @@ mapf_base:
         publish_frequency: 1.0
 
         global_frame: map
+        # The launch file rewrites this to the first robot namespace from the shared team config.
         robot_base_frame: robot1/base_link
 
         track_unknown_space: true

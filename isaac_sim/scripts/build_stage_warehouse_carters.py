@@ -2,21 +2,20 @@
 """
 Isaac Sim 5.1 stage builder:
 - references a warehouse environment USD
-- references /Isaac/Samples/ROS2/Robots/Nova_Carter_ROS.usd twice
-- sets ROS2 nodeNamespace under each robot to robot1 / robot2 to avoid topic collisions
+- references /Isaac/Samples/ROS2/Robots/Nova_Carter_ROS.usd for each configured robot
+- loads robot namespaces and spawn poses from a shared team config yaml
 - (optional) saves the stage
 
 Run standalone:
-  ./python.sh /abs/path/to/build_warehouse_two_nova_carters.py
+  ./python.sh /abs/path/to/build_stage_warehouse_carters.py
 
 Env vars (recommended):
-  export ISAAC_ENV_USD="omniverse://localhost/NVIDIA/Assets/Isaac/Environments/Simple_Warehouse/warehouse.usd"
-  export ISAAC_NOVA_CARTER_ROS_USD="omniverse://localhost/Isaac/Samples/ROS2/Robots/Nova_Carter_ROS.usd"
+  export CARTER_TEAM_CONFIG_FILE="/abs/path/to/warehouse_team_config.yaml"
   export OUTPUT_USD="/home/you/.../warehouse_two_robots.usd"
 """
 
+import importlib.util
 import os
-import math
 from typing import Tuple
 
 STANDALONE = True
@@ -35,7 +34,41 @@ STANDALONE = True
 ENV_USD_REL = "/Isaac/Environments/Simple_Warehouse/warehouse_with_forklifts.usd"
 NOVA_CARTER_ROS_USD_REL = "/Isaac/Samples/ROS2/Robots/Nova_Carter_ROS.usd"
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+MAPS_DIR = os.path.join(REPO_ROOT, "ros2_ws", "src", "carters_nav2", "maps")
+TEAM_CONFIG_UTILS_PATH = os.path.join(
+    REPO_ROOT,
+    "ros2_ws",
+    "src",
+    "carters_nav2",
+    "launch",
+    "team_config_utils.py",
+)
+DEFAULT_TEAM_CONFIG_FILE = os.path.join(
+    REPO_ROOT,
+    "ros2_ws",
+    "src",
+    "carters_nav2",
+    "config",
+    "warehouse",
+    "warehouse_team_config.yaml",
+)
+TEAM_CONFIG_FILE = os.environ.get("CARTER_TEAM_CONFIG_FILE", DEFAULT_TEAM_CONFIG_FILE)
 OUTPUT_USD = os.environ.get("OUTPUT_USD", "")  # optional
+
+
+def _load_team_config_utils():
+    spec = importlib.util.spec_from_file_location("team_config_utils", TEAM_CONFIG_UTILS_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load team config utilities from {TEAM_CONFIG_UTILS_PATH}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+team_config_utils = _load_team_config_utils()
 
 
 ##########################################
@@ -50,7 +83,8 @@ def _maybe_start_sim_app():
     # CRITICAL: Do not import other omni.* or isaacsim.* modules before this!
     # from omni.isaac.kit import SimulationApp
     from isaacsim.simulation_app import SimulationApp
-    sim_app = SimulationApp({"headless": False})
+    # sim_app = SimulationApp({"headless": False})
+    sim_app = SimulationApp({"headless": True})
 
     # 2. Import the extension utility
     from omni.isaac.core.utils.extensions import enable_extension
@@ -376,6 +410,7 @@ def _print_prim_inputs(prim_path: str):
 def build_stage():
     from isaacsim.storage.native import get_assets_root_path
     assets_root_path = get_assets_root_path()
+    team_config = team_config_utils.load_team_config(TEAM_CONFIG_FILE, maps_dir=MAPS_DIR)
 
     _new_stage()
     _set_stage_units(1.0)
@@ -389,32 +424,28 @@ def build_stage():
     env_prim = "/World/Env/Warehouse"
     _add_reference(f"{assets_root_path}{ENV_USD_REL}", env_prim)
 
-    # 2) Two robots (ROS-enabled USD)
+    # 2) Robots from the shared team config.
     carter_usd = f"{assets_root_path}{NOVA_CARTER_ROS_USD_REL}"
-    r1 = "/World/Robots/NovaCarter_1"
-    r2 = "/World/Robots/NovaCarter_2"
-    _add_reference(carter_usd, r1)
-    _add_reference(carter_usd, r2)
-    # # extra check
-    # _debug_instanceability(r1)
-    # _debug_instanceability(r2)
-    
-    # add robot namesapces
-    _set_isaac_namespace(r1, "robot1")
-    _set_isaac_namespace(r2, "robot2")
+    for index, robot in enumerate(team_config["robots"], start=1):
+        robot_prim = f"/World/Robots/NovaCarter_{index}"
+        initial_pose = team_config_utils.pose_array_to_pose_dict(robot["initial_pose"])
 
-    # Place them (adjust to your warehouse origin/layout)
-    _set_xform_pose(r1, (0.0, 0.0, 0.0), yaw_deg=0.0)
-    _set_xform_pose(r2, (2.5, 0.0, 0.0), yaw_deg=180.0)
+        _add_reference(carter_usd, robot_prim)
+        _set_isaac_namespace(robot_prim, robot["name"])
+        _set_xform_pose(
+            robot_prim,
+            (
+                initial_pose["x"],
+                initial_pose["y"],
+                initial_pose["z"],
+            ),
+            yaw_deg=initial_pose["yaw"] * 180.0 / 3.141592653589793,
+        )
 
-    # 3) Namespace ROS2 nodes to avoid topic collisions
-    # This leverages the ROS2 bridge 'inputs:nodeNamespace' field (e.g., SubscribeTwist has it).
-    # _set_ros2_node_namespace_under(r1, "robot1")
-    # _set_ros2_node_namespace_under(r2, "robot2")
-    # Match Isaac Sim's multi-robot Nav2 example: namespace ROS topics per robot,
-    # but keep TF frame ids as the asset defaults (map / odom / base_link / sensor frames).
-    _fix_ros2_graph_under(r1, "robot1", prefix_frames=False)
-    _fix_ros2_graph_under(r2, "robot2", prefix_frames=False)
+        # Match Isaac Sim's multi-robot Nav2 example: namespace ROS topics per robot,
+        # but keep TF frame ids as the asset defaults (map / odom / base_link / sensor frames).
+        _fix_ros2_graph_under(robot_prim, robot["name"], prefix_frames=False)
+
     _ensure_global_ros2_clock_graph("/clock")
 
     # 4) Save (optional)
@@ -423,7 +454,10 @@ def build_stage():
         omni.usd.get_context().save_as_stage(OUTPUT_USD)
         print(f"[OK] Saved stage to: {OUTPUT_USD}")
 
-    print("[OK] Stage built: warehouse + 2x Nova_Carter_ROS (namespaced)")
+    print(
+        "[OK] Stage built: warehouse + "
+        f"{team_config['agent_num']} Nova_Carter_ROS robots from {TEAM_CONFIG_FILE}"
+    )
 
     # debug camera topic collisions
     # _find_ros2_camera_publishers()
@@ -440,12 +474,24 @@ def main():
     try:
         build_stage()
 
-        # In standalone, keep UI alive so you can press Play and inspect the graph/topics.
-        if sim_app is not None:
-            import time
-            while sim_app.is_running():
-                sim_app.update()
-                # time.sleep(0.1)
+        # one or two updates after stage creation helps graphs/materialization settle
+        for _ in range(10):
+            sim_app.update()
+
+        import omni.timeline
+        timeline = omni.timeline.get_timeline_interface()
+        timeline.play()
+
+        print("[OK] Timeline started from Python")
+
+        while sim_app.is_running():
+            sim_app.update()
+        # # In standalone, keep UI alive so you can press Play and inspect the graph/topics.
+        # if sim_app is not None:
+        #     import time
+        #     while sim_app.is_running():
+        #         sim_app.update()
+        #         # time.sleep(0.1)
     finally:
         if sim_app is not None:
             sim_app.close()

@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+import importlib.util
 import os
 
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, TimerAction
+from launch.actions import DeclareLaunchArgument, GroupAction, OpaqueFunction, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -14,90 +17,105 @@ from launch_ros.actions import Node
 
 ############################################################################
 #### Launch warehouse MAPF demo with nav2 path follower: ###################
-# 1. Start Isaac Sim on host machine (source ros2 environment first to enable ros2 bridge)
-# $ cd ~/isaac_sim
-# $ ./python.sh /path/to/mas-vln/isaac_sim/scripts/build_stage_warehouse_carters.py
-# 2. Launch caters nav2 example in Isaac ROS docker (source ros2 and ros2_ws)
-# $ ros2 launch carters_nav2 warehouse_two_carters_nav2.launch.py
-# 3. In another terminal, launch this MAPF demo (source ros2 and ros2_ws)
-# $ ros2 launch carters_goal isaac_ros_mapf.launch.py run_plan_executor:=true
+# 1. Start Isaac Sim on the host machine.
+#    $ ./python.sh /path/to/mas-vln/isaac_sim/scripts/build_stage_warehouse_carters.py
+# 2. Launch the Nav2 side with the same team config.
+#    $ ros2 launch carters_nav2 warehouse_two_carters_nav2.launch.py
+# 3. Launch MAPF execution with the same team config.
+#    $ ros2 launch carters_goal isaac_ros_mapf.launch.py run_plan_executor:=true
 ############################################################################
 
 
-def generate_launch_description():
+def _load_team_config_utils():
     carters_nav2_dir = get_package_share_directory("carters_nav2")
-    carters_goal_dir = get_package_share_directory("carters_goal")
+    helper_path = os.path.join(carters_nav2_dir, "launch", "team_config_utils.py")
+    spec = importlib.util.spec_from_file_location("team_config_utils", helper_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load team config utilities from {helper_path}")
 
-    default_map = os.path.join(
-        carters_nav2_dir,
-        "maps",
-        "carter_warehouse_navigation_mapf.yaml",
-    )
-    mapf_params = os.path.join(carters_goal_dir, "config", "mapf_params_isaac.yaml")
-    costmap_params = os.path.join(
-        carters_goal_dir,
-        "config",
-        "mapf_costmap_params_isaac.yaml",
-    )
-    initial_pose_tf_params = os.path.join(
-        carters_goal_dir,
-        "config",
-        "initial_pose_tf_params_isaac.yaml",
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+team_config_utils = _load_team_config_utils()
+
+
+def _launch_setup(context, *args, **kwargs):
+    carters_nav2_dir = get_package_share_directory("carters_nav2")
+
+    maps_dir = os.path.join(carters_nav2_dir, "maps")
+    team_config_path = LaunchConfiguration("team_config_file").perform(context)
+    map_override = LaunchConfiguration("map").perform(context)
+    mapf_params_path = LaunchConfiguration("mapf_params_file").perform(context)
+    costmap_params_path = LaunchConfiguration("mapf_costmap_params_file").perform(context)
+    initial_pose_tf_params_path = LaunchConfiguration("initial_pose_tf_params_file").perform(context)
+
+    team_config = team_config_utils.load_team_config(team_config_path, maps_dir=maps_dir)
+    robot_namespaces = team_config["robot_namespaces"]
+    agent_num = team_config["agent_num"]
+    map_file = map_override or team_config["mapf_map"]
+    if not map_file:
+        raise RuntimeError(
+            "No MAPF map was provided. Set environment.mapf_map in the team config "
+            "or pass map:=/abs/path/to/map.yaml."
+        )
+
+    agent_name_map = {
+        f"agent_{index}": namespace for index, namespace in enumerate(robot_namespaces)
+    }
+    base_frame_map = team_config_utils.build_agent_indexed_map(robot_namespaces, "base_link")
+    plan_topic_map = team_config_utils.build_agent_indexed_map(robot_namespaces, "plan")
+    goal_topic_map = team_config_utils.build_agent_indexed_map(robot_namespaces, "goal")
+
+    mapf_params = team_config_utils.load_yaml_file(mapf_params_path)
+    mapf_params["mapf_base"]["mapf_base_node"]["ros__parameters"]["agent_num"] = agent_num
+    mapf_params["mapf_base"]["mapf_base_node"]["ros__parameters"]["base_frame_id"] = base_frame_map
+    mapf_params["mapf_base"]["mapf_base_node"]["ros__parameters"]["plan_topic"] = plan_topic_map
+    mapf_params["mapf_base"]["goal_transformer"]["ros__parameters"]["agent_num"] = agent_num
+    mapf_params["mapf_base"]["goal_transformer"]["ros__parameters"]["goal_topic"] = goal_topic_map
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["agent_num"] = agent_num
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["agent_name"] = agent_name_map
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["base_frame_id"] = base_frame_map
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["plan_topic"] = plan_topic_map
+    generated_mapf_params = team_config_utils.write_temp_yaml("carters_goal_mapf_", mapf_params)
+
+    costmap_params = team_config_utils.load_yaml_file(costmap_params_path)
+    costmap_params["mapf_base"]["mapf_costmap"]["mapf_costmap"]["ros__parameters"][
+        "robot_base_frame"
+    ] = f"{robot_namespaces[0]}/base_link"
+    generated_costmap_params = team_config_utils.write_temp_yaml(
+        "carters_goal_costmap_",
+        costmap_params,
     )
 
-    map_arg = DeclareLaunchArgument(
-        "map",
-        default_value=default_map,
-        description="Full path to map yaml for mapf map_server",
-    )
-    use_sim_time_arg = DeclareLaunchArgument(
-        "use_sim_time",
-        default_value="true",
-        description="Use simulation clock",
-    )
-    autostart_arg = DeclareLaunchArgument(
-        "autostart",
-        default_value="true",
-        description="Autostart lifecycle nodes",
-    )
-    mapf_planner_arg = DeclareLaunchArgument(
-        "mapf_planner",
-        default_value="mapf_planner/CBSROS",
-        description="MAPF planner plugin name",
-    )
-    run_goal_pub_arg = DeclareLaunchArgument(
-        "run_goal_publisher",
-        default_value="true",
-        description="Run example MAPF goal publisher",
-    )
-    run_tf_bridge_arg = DeclareLaunchArgument(
-        "run_tf_bridge",
-        default_value="true",
-        description="Bridge /robotX/tf into global /tf with prefixed frame ids",
-    )
-    run_initial_pose_tf_arg = DeclareLaunchArgument(
-        "run_initial_pose_tf",
-        default_value="true",
-        description="Publish static map->robotX/odom transforms from Isaac spawn poses",
-    )
-    run_plan_executor_arg = DeclareLaunchArgument(
-        "run_plan_executor",
-        default_value="false",
-        description="Execute sparse MAPF plans through Nav2 NavigateToPose servers",
+    initial_pose_tf_params = team_config_utils.load_yaml_file(initial_pose_tf_params_path)
+    initial_pose_tf_params["initial_pose_tf_publisher"]["ros__parameters"][
+        "robot_namespaces"
+    ] = robot_namespaces
+    initial_pose_tf_params["initial_pose_tf_publisher"]["ros__parameters"][
+        "initial_poses"
+    ] = team_config["initial_pose_array"]
+    generated_initial_pose_tf_params = team_config_utils.write_temp_yaml(
+        "carters_goal_initial_pose_tf_",
+        initial_pose_tf_params,
     )
 
-    map_file = LaunchConfiguration("map")
     use_sim_time = LaunchConfiguration("use_sim_time")
     autostart = LaunchConfiguration("autostart")
     mapf_planner = LaunchConfiguration("mapf_planner")
+    core_startup_delay = LaunchConfiguration("core_startup_delay")
+    lifecycle_manager_delay = LaunchConfiguration("lifecycle_manager_delay")
     run_goal_publisher = LaunchConfiguration("run_goal_publisher")
+    goal_publisher_delay = LaunchConfiguration("goal_publisher_delay")
     run_tf_bridge = LaunchConfiguration("run_tf_bridge")
     run_initial_pose_tf = LaunchConfiguration("run_initial_pose_tf")
     run_plan_executor = LaunchConfiguration("run_plan_executor")
+    plan_executor_delay = LaunchConfiguration("plan_executor_delay")
 
     lifecycle_nodes = ["map_server", "mapf_base_node"]
 
-    mapf_group = GroupAction(
+    mapf_core_group = GroupAction(
         [
             Node(
                 namespace="mapf_base",
@@ -106,7 +124,7 @@ def generate_launch_description():
                 name="map_server",
                 output="screen",
                 parameters=[
-                    mapf_params,
+                    generated_mapf_params,
                     {
                         "yaml_filename": map_file,
                         "use_sim_time": use_sim_time,
@@ -120,8 +138,8 @@ def generate_launch_description():
                 name="mapf_base_node",
                 output="screen",
                 parameters=[
-                    costmap_params,
-                    mapf_params,
+                    generated_costmap_params,
+                    generated_mapf_params,
                     {
                         "mapf_planner": mapf_planner,
                         "use_sim_time": use_sim_time,
@@ -130,27 +148,28 @@ def generate_launch_description():
             ),
             Node(
                 namespace="mapf_base",
-                package="nav2_lifecycle_manager",
-                executable="lifecycle_manager",
-                name="lifecycle_manager_mapf",
-                output="screen",
-                parameters=[
-                    {
-                        "use_sim_time": use_sim_time,
-                        "autostart": autostart,
-                        "node_names": lifecycle_nodes,
-                    }
-                ],
-            ),
-            Node(
-                namespace="mapf_base",
                 package="mapf_base",
                 executable="goal_transformer",
                 name="goal_transformer",
                 output="screen",
-                parameters=[mapf_params, {"use_sim_time": use_sim_time}],
+                parameters=[generated_mapf_params, {"use_sim_time": use_sim_time}],
             ),
         ]
+    )
+
+    lifecycle_manager = Node(
+        namespace="mapf_base",
+        package="nav2_lifecycle_manager",
+        executable="lifecycle_manager",
+        name="lifecycle_manager_mapf",
+        output="screen",
+        parameters=[
+            {
+                "use_sim_time": use_sim_time,
+                "autostart": autostart,
+                "node_names": lifecycle_nodes,
+            }
+        ],
     )
 
     tf_bridge = Node(
@@ -159,11 +178,7 @@ def generate_launch_description():
         name="namespaced_tf_bridge",
         output="screen",
         condition=IfCondition(run_tf_bridge),
-        parameters=[
-            {
-                "robot_namespaces": ["robot1", "robot2"],
-            }
-        ],
+        parameters=[{"robot_namespaces": robot_namespaces}],
     )
 
     initial_pose_tf_publisher = Node(
@@ -172,16 +187,18 @@ def generate_launch_description():
         name="initial_pose_tf_publisher",
         output="screen",
         condition=IfCondition(run_initial_pose_tf),
-        parameters=[initial_pose_tf_params, {"use_sim_time": use_sim_time}],
+        parameters=[generated_initial_pose_tf_params, {"use_sim_time": use_sim_time}],
     )
 
-    mapf_startup = TimerAction(
-        period=1.0,
-        actions=[mapf_group],
+    mapf_core_startup = TimerAction(period=core_startup_delay, actions=[mapf_core_group])
+
+    lifecycle_manager_startup = TimerAction(
+        period=lifecycle_manager_delay,
+        actions=[lifecycle_manager],
     )
 
     goal_publisher = TimerAction(
-        period=2.0,
+        period=goal_publisher_delay,
         actions=[
             Node(
                 package="carters_goal",
@@ -200,6 +217,8 @@ def generate_launch_description():
                         "wait_for_subscribers": True,
                         "wait_for_mapf_active": True,
                         "stop_on_plan": True,
+                        "agent_num": agent_num,
+                        "goal_array": team_config["goal_pose_array"],
                     }
                 ],
             )
@@ -207,7 +226,7 @@ def generate_launch_description():
     )
 
     plan_executor = TimerAction(
-        period=3.0,
+        period=plan_executor_delay,
         actions=[
             Node(
                 namespace="mapf_base",
@@ -216,25 +235,132 @@ def generate_launch_description():
                 name="plan_executor",
                 output="screen",
                 condition=IfCondition(run_plan_executor),
-                parameters=[mapf_params, {"use_sim_time": use_sim_time}],
+                parameters=[generated_mapf_params, {"use_sim_time": use_sim_time}],
             )
         ],
+    )
+
+    return [
+        tf_bridge,
+        initial_pose_tf_publisher,
+        mapf_core_startup,
+        lifecycle_manager_startup,
+        goal_publisher,
+        plan_executor,
+    ]
+
+
+def generate_launch_description():
+    carters_nav2_dir = get_package_share_directory("carters_nav2")
+    carters_goal_dir = get_package_share_directory("carters_goal")
+
+    map_arg = DeclareLaunchArgument(
+        "map",
+        default_value="",
+        description=(
+            "Optional full path to the map yaml for MAPF. "
+            "If empty, the value from the team config is used."
+        ),
+    )
+    team_config_arg = DeclareLaunchArgument(
+        "team_config_file",
+        default_value=os.path.join(
+            carters_nav2_dir,
+            "config",
+            "warehouse",
+            "warehouse_team_config.yaml",
+        ),
+        description="Full path to the shared robot team configuration YAML.",
+    )
+    mapf_params_arg = DeclareLaunchArgument(
+        "mapf_params_file",
+        default_value=os.path.join(carters_goal_dir, "config", "mapf_params_isaac.yaml"),
+        description="Base MAPF params YAML. Robot-specific sections are generated at launch time.",
+    )
+    costmap_params_arg = DeclareLaunchArgument(
+        "mapf_costmap_params_file",
+        default_value=os.path.join(carters_goal_dir, "config", "mapf_costmap_params_isaac.yaml"),
+        description="Base MAPF costmap params YAML. Robot-specific sections are generated at launch time.",
+    )
+    initial_pose_tf_params_arg = DeclareLaunchArgument(
+        "initial_pose_tf_params_file",
+        default_value=os.path.join(carters_goal_dir, "config", "initial_pose_tf_params_isaac.yaml"),
+        description="Base initial pose TF params YAML. Robot-specific sections are generated at launch time.",
+    )
+    use_sim_time_arg = DeclareLaunchArgument(
+        "use_sim_time",
+        default_value="true",
+        description="Use simulation clock.",
+    )
+    autostart_arg = DeclareLaunchArgument(
+        "autostart",
+        default_value="true",
+        description="Autostart lifecycle nodes.",
+    )
+    mapf_planner_arg = DeclareLaunchArgument(
+        "mapf_planner",
+        default_value="mapf_planner/CBSROS",
+        description="MAPF planner plugin name.",
+    )
+    core_startup_delay_arg = DeclareLaunchArgument(
+        "core_startup_delay",
+        default_value="1.0",
+        description="Seconds to wait before launching map_server, mapf_base_node, and goal_transformer.",
+    )
+    lifecycle_manager_delay_arg = DeclareLaunchArgument(
+        "lifecycle_manager_delay",
+        default_value="4.0",
+        description="Seconds to wait before starting the lifecycle manager bringup sequence.",
+    )
+    run_goal_pub_arg = DeclareLaunchArgument(
+        "run_goal_publisher",
+        default_value="true",
+        description="Run MAPF goal publisher.",
+    )
+    goal_publisher_delay_arg = DeclareLaunchArgument(
+        "goal_publisher_delay",
+        default_value="2.0",
+        description="Seconds to wait before starting the MAPF goal publisher.",
+    )
+    run_tf_bridge_arg = DeclareLaunchArgument(
+        "run_tf_bridge",
+        default_value="true",
+        description="Bridge /robotX/tf into global /tf with prefixed frame ids.",
+    )
+    run_initial_pose_tf_arg = DeclareLaunchArgument(
+        "run_initial_pose_tf",
+        default_value="true",
+        description="Publish static map->robotX/odom transforms from the team config spawn poses.",
+    )
+    run_plan_executor_arg = DeclareLaunchArgument(
+        "run_plan_executor",
+        default_value="false",
+        description="Execute sparse MAPF plans through Nav2 FollowPath servers.",
+    )
+    plan_executor_delay_arg = DeclareLaunchArgument(
+        "plan_executor_delay",
+        default_value="5.0",
+        description="Seconds to wait before starting the Nav2 FollowPath executor.",
     )
 
     return LaunchDescription(
         [
             map_arg,
+            team_config_arg,
+            mapf_params_arg,
+            costmap_params_arg,
+            initial_pose_tf_params_arg,
             use_sim_time_arg,
             autostart_arg,
             mapf_planner_arg,
+            core_startup_delay_arg,
+            lifecycle_manager_delay_arg,
             run_goal_pub_arg,
+            goal_publisher_delay_arg,
             run_tf_bridge_arg,
             run_initial_pose_tf_arg,
             run_plan_executor_arg,
-            tf_bridge,
-            initial_pose_tf_publisher,
-            mapf_startup,
-            goal_publisher,
-            plan_executor,
+            plan_executor_delay_arg,
+            OpaqueFunction(function=_launch_setup),
         ]
     )

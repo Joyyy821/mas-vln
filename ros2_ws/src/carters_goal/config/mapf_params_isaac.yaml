@@ -6,6 +6,7 @@ mapf_base:
   mapf_base_node:
     ros__parameters:
       use_sim_time: true
+      # agent_num plus per-agent topics/frames are rewritten at launch time from the shared team config.
       agent_num: 2
       global_frame_id: map
 

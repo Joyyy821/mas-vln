@@ -18,11 +18,9 @@ import os
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression, TextSubstitution
-from launch_ros.actions import Node
+from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
@@ -41,6 +39,7 @@ def generate_launch_description():
     default_bt_xml_filename = LaunchConfiguration("default_bt_xml_filename")
     autostart = LaunchConfiguration("autostart")
     use_composition = LaunchConfiguration("use_composition")
+    use_respawn = LaunchConfiguration("use_respawn")
 
     # Declare the launch arguments
     declare_namespace_cmd = DeclareLaunchArgument("namespace", default_value="", description="Top-level namespace")
@@ -82,6 +81,13 @@ def generate_launch_description():
     declare_use_composition_cmd = DeclareLaunchArgument(
         "use_composition", default_value="False", description="Whether to use composed bringup"
     )
+
+    declare_use_respawn_cmd = DeclareLaunchArgument(
+        "use_respawn",
+        default_value="True",
+        description="Whether to respawn Nav2 servers if one exits unexpectedly",
+    )
+
     bringup_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(nav2_launch_dir, "bringup_launch.py")),
         launch_arguments={
@@ -94,6 +100,7 @@ def generate_launch_description():
             "default_bt_xml_filename": default_bt_xml_filename,
             "autostart": autostart,
             "use_composition": use_composition,
+            "use_respawn": use_respawn,
         }.items(),   
     )
 
@@ -110,6 +117,7 @@ def generate_launch_description():
     ld.add_action(declare_bt_xml_cmd)
     ld.add_action(declare_autostart_cmd)
     ld.add_action(declare_use_composition_cmd)
+    ld.add_action(declare_use_respawn_cmd)
     ld.add_action(bringup_cmd)
 
     return ld

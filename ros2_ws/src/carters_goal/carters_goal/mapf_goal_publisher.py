@@ -8,6 +8,7 @@ from typing import List
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import PoseArray, Pose
 from lifecycle_msgs.msg import TransitionEvent
@@ -16,7 +17,7 @@ from mapf_msgs.msg import GlobalPlan
 
 
 class MapfGoalPublisher(Node):
-    def __init__(self, default_goals: List[List[float]]) -> None:
+    def __init__(self) -> None:
         super().__init__("mapf_goal_publisher")
 
         self.declare_parameter("goal_topic", "/mapf_base/goal_for_each")
@@ -24,7 +25,7 @@ class MapfGoalPublisher(Node):
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("publish_period_sec", 0.5)
         self.declare_parameter("publish_count", 5)
-        self.declare_parameter("agent_num", len(default_goals))
+        self.declare_parameter("agent_num", 0)
         self.declare_parameter("wait_for_subscribers", True)
         self.declare_parameter("wait_for_mapf_active", True)
         self.declare_parameter("stop_on_plan", True)
@@ -32,9 +33,7 @@ class MapfGoalPublisher(Node):
         self.declare_parameter(
             "mapf_transition_topic", "/mapf_base/mapf_base_node/transition_event"
         )
-
-        flat_default = [value for goal in default_goals for value in goal]
-        self.declare_parameter("goal_array", flat_default)
+        self.declare_parameter("goal_array", Parameter.Type.DOUBLE_ARRAY)
 
         self._goal_topic = self.get_parameter("goal_topic").value
         self._goal_init_topic = self.get_parameter("goal_init_topic").value
@@ -48,7 +47,14 @@ class MapfGoalPublisher(Node):
         self._mapf_transition_topic = self.get_parameter("mapf_transition_topic").value
 
         period = float(self.get_parameter("publish_period_sec").value)
-        flat_goal_array = list(self.get_parameter("goal_array").value)
+        flat_goal_array = [float(value) for value in self.get_parameter("goal_array").value]
+
+        if self._agent_num <= 0:
+            if not flat_goal_array or len(flat_goal_array) % 7 != 0:
+                raise ValueError(
+                    "agent_num must be set or goal_array must contain 7 values per robot."
+                )
+            self._agent_num = len(flat_goal_array) // 7
 
         self._pose_array = self._build_pose_array(flat_goal_array)
         self._goal_init_msg = Bool()
@@ -188,13 +194,8 @@ class MapfGoalPublisher(Node):
 
 
 def main() -> None:
-    example_goals = [
-        [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        [2.0, 3.0, 0.0, 0.0, 0.0, 0.70710678, 0.70710678],
-    ]
-
     rclpy.init()
-    node = MapfGoalPublisher(example_goals)
+    node = MapfGoalPublisher()
     try:
         rclpy.spin(node)
     finally:

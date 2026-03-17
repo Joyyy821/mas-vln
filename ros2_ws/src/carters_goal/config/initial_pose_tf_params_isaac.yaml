@@ -3,6 +3,7 @@ initial_pose_tf_publisher:
     use_sim_time: true
     global_frame: map
     odom_frame: odom
+    # These arrays are overwritten at launch time from the shared team config.
     robot_namespaces: ["robot1", "robot2"]
 
     # Spawn poses from isaac_sim/scripts/build_stage_warehouse_carters.py.
