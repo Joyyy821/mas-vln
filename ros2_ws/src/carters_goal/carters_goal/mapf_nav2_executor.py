@@ -9,12 +9,14 @@ from typing import List
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Quaternion
+from geometry_msgs.msg import Quaternion, Twist
 from mapf_msgs.msg import GlobalPlan
 from nav2_msgs.action import FollowPath
 from nav_msgs.msg import Path
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 class MapfNav2Executor(Node):
@@ -24,6 +26,11 @@ class MapfNav2Executor(Node):
         self.declare_parameter("agent_num", 1)
         self.declare_parameter("global_frame_id", "map")
         self.declare_parameter("global_plan_topic", "global_plan")
+        self.declare_parameter("control_frequency", 10.0)
+        self.declare_parameter("goal_yaw_tolerance", 0.08)
+        self.declare_parameter("pre_rotate_yaw_tolerance", 0.12)
+        self.declare_parameter("angular_kp", 2.0)
+        self.declare_parameter("max_angular_speed", 1.0)
         self.declare_parameter("controller_id", "")
         self.declare_parameter("goal_checker_id", "")
         self.declare_parameter("progress_checker_id", "")
@@ -31,27 +38,57 @@ class MapfNav2Executor(Node):
         self._agent_num = int(self.get_parameter("agent_num").value)
         self._global_frame_id = str(self.get_parameter("global_frame_id").value)
         self._global_plan_topic = str(self.get_parameter("global_plan_topic").value)
+        self._control_frequency = float(self.get_parameter("control_frequency").value)
+        self._goal_yaw_tolerance = float(self.get_parameter("goal_yaw_tolerance").value)
+        self._pre_rotate_yaw_tolerance = float(
+            self.get_parameter("pre_rotate_yaw_tolerance").value
+        )
+        self._angular_kp = float(self.get_parameter("angular_kp").value)
+        self._max_angular_speed = float(self.get_parameter("max_angular_speed").value)
         self._controller_id = str(self.get_parameter("controller_id").value)
         self._goal_checker_id = str(self.get_parameter("goal_checker_id").value)
         self._progress_checker_id = str(self.get_parameter("progress_checker_id").value)
 
         self._agent_names: List[str] = []
+        self._base_frame_ids: List[str] = []
+        self._cmd_vel_topics: List[str] = []
+        self._cmd_vel_publishers = []
         self._action_clients: List[ActionClient] = []
         for idx in range(self._agent_num):
-            param_name = f"agent_name.agent_{idx}"
+            agent_param = f"agent_name.agent_{idx}"
+            base_frame_param = f"base_frame_id.agent_{idx}"
+            cmd_vel_param = f"cmd_vel_topic.agent_{idx}"
             default_agent_name = f"robot{idx + 1}"
-            self.declare_parameter(param_name, default_agent_name)
-            agent_name = str(self.get_parameter(param_name).value)
+
+            self.declare_parameter(agent_param, default_agent_name)
+            self.declare_parameter(base_frame_param, f"{default_agent_name}/base_link")
+            self.declare_parameter(cmd_vel_param, f"/{default_agent_name}/cmd_vel")
+
+            agent_name = str(self.get_parameter(agent_param).value)
+            base_frame_id = str(self.get_parameter(base_frame_param).value)
+            cmd_vel_topic = str(self.get_parameter(cmd_vel_param).value)
+
             self._agent_names.append(agent_name)
+            self._base_frame_ids.append(base_frame_id)
+            self._cmd_vel_topics.append(cmd_vel_topic)
+            self._cmd_vel_publishers.append(self.create_publisher(Twist, cmd_vel_topic, 1))
             self._action_clients.append(
                 ActionClient(self, FollowPath, f"/{agent_name}/follow_path")
             )
+
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
         self._current_plan: GlobalPlan | None = None
         self._pending_plan: GlobalPlan | None = None
         self._active = False
         self._execution_id = 0
         self._completed = [False] * self._agent_num
+        self._phases = ["idle"] * self._agent_num
+        self._controller_paths: List[Path | None] = [None] * self._agent_num
+        self._pre_rotate_yaws: List[float | None] = [None] * self._agent_num
+        self._final_goal_yaws: List[float | None] = [None] * self._agent_num
+        self._last_tf_warn_ns = [0] * self._agent_num
 
         self._plan_sub = self.create_subscription(
             GlobalPlan,
@@ -60,6 +97,15 @@ class MapfNav2Executor(Node):
             1,
         )
         self._startup_timer = self.create_timer(0.5, self._start_pending_plan)
+        self._execution_timer = self.create_timer(
+            1.0 / self._control_frequency,
+            self._execution_timer_callback,
+        )
+        self.get_logger().info(
+            "Initialized MAPF Nav2 executor on "
+            f"'{self.resolve_topic_name(self._global_plan_topic)}' "
+            f"for {self._agent_num} agents. FollowPath targets: {self._agent_names}"
+        )
 
     def _plan_callback(self, plan_msg: GlobalPlan) -> None:
         if len(plan_msg.global_plan) < self._agent_num:
@@ -99,6 +145,11 @@ class MapfNav2Executor(Node):
         self._active = True
         self._execution_id += 1
         self._completed = [False] * self._agent_num
+        self._phases = ["idle"] * self._agent_num
+        self._controller_paths = [None] * self._agent_num
+        self._pre_rotate_yaws = [None] * self._agent_num
+        self._final_goal_yaws = [None] * self._agent_num
+
         self.get_logger().info(
             f"Starting FollowPath execution of MAPF plan with makespan "
             f"{self._current_plan.makespan}."
@@ -110,8 +161,6 @@ class MapfNav2Executor(Node):
             self._active = False
             return
 
-        execution_id = self._execution_id
-
         for agent_idx in range(self._agent_num):
             raw_path = self._current_plan.global_plan[agent_idx].plan
             controller_path = self._build_controller_path(raw_path)
@@ -120,34 +169,99 @@ class MapfNav2Executor(Node):
                     f"Agent {agent_idx} has an empty MAPF path. Marking as complete."
                 )
                 self._completed[agent_idx] = True
+                self._phases[agent_idx] = "done"
                 continue
-
-            goal_msg = FollowPath.Goal()
-            goal_msg.path = controller_path
-            goal_fields = goal_msg.get_fields_and_field_types()
-            if "controller_id" in goal_fields:
-                goal_msg.controller_id = self._controller_id
-            if "goal_checker_id" in goal_fields:
-                goal_msg.goal_checker_id = self._goal_checker_id
-            if "progress_checker_id" in goal_fields:
-                goal_msg.progress_checker_id = self._progress_checker_id
 
             first_pose = controller_path.poses[0].pose.position
             last_pose = controller_path.poses[-1].pose.position
             self.get_logger().info(
-                f"Agent {agent_idx} send FollowPath with {len(controller_path.poses)} poses "
+                f"Agent {agent_idx} prepared FollowPath with {len(controller_path.poses)} poses "
                 f"from ({first_pose.x:.3f}, {first_pose.y:.3f}) "
                 f"to ({last_pose.x:.3f}, {last_pose.y:.3f})"
             )
 
-            send_goal_future = self._action_clients[agent_idx].send_goal_async(goal_msg)
-            send_goal_future.add_done_callback(
-                lambda future, idx=agent_idx, exec_id=execution_id: self._goal_response_callback(
-                    future, idx, exec_id
-                )
+            self._controller_paths[agent_idx] = controller_path
+            self._pre_rotate_yaws[agent_idx] = self._quaternion_to_yaw(
+                controller_path.poses[0].pose.orientation
             )
+            self._final_goal_yaws[agent_idx] = self._extract_final_goal_yaw(raw_path)
+            self._phases[agent_idx] = "pre_rotate"
 
         self._check_if_finished()
+
+    def _execution_timer_callback(self) -> None:
+        if not self._active:
+            return
+
+        execution_id = self._execution_id
+        for agent_idx in range(self._agent_num):
+            phase = self._phases[agent_idx]
+
+            if phase == "pre_rotate":
+                if not self._rotate_agent_towards(
+                    agent_idx,
+                    self._pre_rotate_yaws[agent_idx],
+                    self._pre_rotate_yaw_tolerance,
+                ):
+                    continue
+
+                self._publish_zero(agent_idx)
+                self._phases[agent_idx] = "follow_path_pending"
+                self._send_follow_path(agent_idx, execution_id)
+                continue
+
+            if phase == "post_rotate":
+                if not self._rotate_agent_towards(
+                    agent_idx,
+                    self._final_goal_yaws[agent_idx],
+                    self._goal_yaw_tolerance,
+                ):
+                    continue
+
+                self._publish_zero(agent_idx)
+                self._completed[agent_idx] = True
+                self._phases[agent_idx] = "done"
+                self.get_logger().info(
+                    f"Agent {agent_idx} finished its final in-place rotation."
+                )
+                self._check_if_finished()
+                continue
+
+            if phase == "done":
+                self._publish_zero(agent_idx)
+
+    def _send_follow_path(self, agent_idx: int, execution_id: int) -> None:
+        controller_path = self._controller_paths[agent_idx]
+        if controller_path is None or not controller_path.poses:
+            self._completed[agent_idx] = True
+            self._phases[agent_idx] = "done"
+            self._check_if_finished()
+            return
+
+        goal_msg = FollowPath.Goal()
+        goal_msg.path = controller_path
+        goal_fields = goal_msg.get_fields_and_field_types()
+        if "controller_id" in goal_fields and self._controller_id:
+            goal_msg.controller_id = self._controller_id
+        if "goal_checker_id" in goal_fields and self._goal_checker_id:
+            goal_msg.goal_checker_id = self._goal_checker_id
+        if "progress_checker_id" in goal_fields and self._progress_checker_id:
+            goal_msg.progress_checker_id = self._progress_checker_id
+
+        first_pose = controller_path.poses[0].pose.position
+        last_pose = controller_path.poses[-1].pose.position
+        self.get_logger().info(
+            f"Agent {agent_idx} send FollowPath with {len(controller_path.poses)} poses "
+            f"from ({first_pose.x:.3f}, {first_pose.y:.3f}) "
+            f"to ({last_pose.x:.3f}, {last_pose.y:.3f})"
+        )
+
+        send_goal_future = self._action_clients[agent_idx].send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(
+            lambda future, idx=agent_idx, exec_id=execution_id: self._goal_response_callback(
+                future, idx, exec_id
+            )
+        )
 
     def _goal_response_callback(self, future, agent_idx: int, execution_id: int) -> None:
         if execution_id != self._execution_id or not self._active:
@@ -165,6 +279,7 @@ class MapfNav2Executor(Node):
             self._abort_execution()
             return
 
+        self._phases[agent_idx] = "follow_path"
         self.get_logger().info(f"Agent {agent_idx} FollowPath accepted, waiting for result")
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
@@ -196,20 +311,77 @@ class MapfNav2Executor(Node):
             self._abort_execution()
             return
 
-        self.get_logger().info(f"Agent {agent_idx} finished its FollowPath.")
-        self._completed[agent_idx] = True
-        self._check_if_finished()
+        self.get_logger().info(
+            f"Agent {agent_idx} finished FollowPath translation, "
+            "starting final in-place rotation."
+        )
+        self._phases[agent_idx] = "post_rotate"
+
+    def _lookup_robot_pose(self, agent_idx: int) -> tuple[float, float, float] | None:
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self._global_frame_id,
+                self._base_frame_ids[agent_idx],
+                Time(),
+            )
+        except TransformException as exc:
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self._last_tf_warn_ns[agent_idx] > int(2e9):
+                self.get_logger().warn(
+                    f"Unable to lookup {self._global_frame_id} -> "
+                    f"{self._base_frame_ids[agent_idx]}: {exc}"
+                )
+                self._last_tf_warn_ns[agent_idx] = now_ns
+            return None
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        yaw = self._quaternion_to_yaw(rotation)
+        return translation.x, translation.y, yaw
+
+    def _rotate_agent_towards(
+        self,
+        agent_idx: int,
+        target_yaw: float | None,
+        tolerance: float,
+    ) -> bool:
+        if target_yaw is None:
+            return True
+
+        pose = self._lookup_robot_pose(agent_idx)
+        if pose is None:
+            self._publish_zero(agent_idx)
+            return False
+
+        yaw_error = self._normalize_angle(target_yaw - pose[2])
+        if abs(yaw_error) <= tolerance:
+            return True
+
+        twist = Twist()
+        twist.angular.z = self._clamp(
+            self._angular_kp * yaw_error,
+            -self._max_angular_speed,
+            self._max_angular_speed,
+        )
+        self._cmd_vel_publishers[agent_idx].publish(twist)
+        return False
 
     def _check_if_finished(self) -> None:
         if self._active and all(self._completed):
             self.get_logger().info("Finished executing MAPF plan.")
             self._active = False
             self._current_plan = None
+            self._publish_zero_to_all()
             self._start_pending_plan()
 
     def _abort_execution(self) -> None:
         self._active = False
         self._current_plan = None
+        self._phases = ["idle"] * self._agent_num
+        self._controller_paths = [None] * self._agent_num
+        self._pre_rotate_yaws = [None] * self._agent_num
+        self._final_goal_yaws = [None] * self._agent_num
+        self._publish_zero_to_all()
 
     def _build_controller_path(self, raw_path: Path) -> Path:
         path = Path()
@@ -225,7 +397,7 @@ class MapfNav2Executor(Node):
             pose_copy.header.frame_id = self._global_frame_id
             pose_copy.header.stamp = path.header.stamp
 
-            if idx == len(compact_poses) - 1:
+            if len(compact_poses) == 1:
                 pose_copy.pose.orientation = self._normalize_quaternion(
                     compact_poses[idx].pose.orientation
                 )
@@ -235,6 +407,14 @@ class MapfNav2Executor(Node):
             path.poses.append(pose_copy)
 
         return path
+
+    def _extract_final_goal_yaw(self, raw_path: Path) -> float | None:
+        if not raw_path.poses:
+            return None
+
+        return self._quaternion_to_yaw(
+            self._normalize_quaternion(raw_path.poses[-1].pose.orientation)
+        )
 
     def _remove_duplicate_poses(self, raw_path: Path) -> List:
         compact_poses = []
@@ -271,6 +451,13 @@ class MapfNav2Executor(Node):
 
         return 0.0
 
+    def _publish_zero(self, agent_idx: int) -> None:
+        self._cmd_vel_publishers[agent_idx].publish(Twist())
+
+    def _publish_zero_to_all(self) -> None:
+        for agent_idx in range(self._agent_num):
+            self._publish_zero(agent_idx)
+
     def _yaw_to_quaternion(self, yaw: float) -> Quaternion:
         quat = Quaternion()
         quat.z = math.sin(yaw / 2.0)
@@ -295,6 +482,22 @@ class MapfNav2Executor(Node):
         quat_out.w = quat_in.w / norm
         return quat_out
 
+    def _quaternion_to_yaw(self, quat: Quaternion) -> float:
+        return math.atan2(
+            2.0 * (quat.w * quat.z + quat.x * quat.y),
+            1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z),
+        )
+
+    def _normalize_angle(self, angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def _clamp(self, value: float, min_value: float, max_value: float) -> float:
+        return max(min(value, max_value), min_value)
+
     def _squared_distance(self, x0: float, y0: float, x1: float, y1: float) -> float:
         return (x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)
 
@@ -313,6 +516,10 @@ class MapfNav2Executor(Node):
                 if lhs_pose.pose.position.y != rhs_pose.pose.position.y:
                     return False
         return True
+
+    def destroy_node(self) -> bool:
+        self._publish_zero_to_all()
+        return super().destroy_node()
 
 
 def main() -> None:

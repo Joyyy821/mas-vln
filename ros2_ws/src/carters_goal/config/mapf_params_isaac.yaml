@@ -6,54 +6,66 @@ mapf_base:
   mapf_base_node:
     ros__parameters:
       use_sim_time: true
-      # agent_num plus per-agent topics/frames are rewritten at launch time from the shared team config.
-      agent_num: 2
+      # The shared team config owns robot count and names.
+      # These placeholders are rewritten at launch time from warehouse_team_config.yaml.
+      agent_num: 0
       global_frame_id: map
 
       # For offline trajectory generation, allow long solving time.
       planner_time_tolerance: 120.0
       goal_tolerance: 0.5
       continuous_planning: false
+      min_agent_center_distance_m: 1.1
+      static_obstacle_cost_threshold: 1
 
       ecbs:
         suboptimality: 1.2
 
       # Unified TF tree published by NamespacedTfBridge.
-      base_frame_id:
-        agent_0: robot1/base_link
-        agent_1: robot2/base_link
+      base_frame_id: {}
 
-      plan_topic:
-        agent_0: robot1/plan
-        agent_1: robot2/plan
+      plan_topic: {}
 
   goal_transformer:
     ros__parameters:
       use_sim_time: true
-      agent_num: 2
+      # Rewritten at launch time from warehouse_team_config.yaml.
+      agent_num: 0
       goal_for_each_topic: goal_for_each
 
       # Legacy per-agent topics are still accepted by goal_transformer.
-      goal_topic:
-        agent_0: robot1/goal
-        agent_1: robot2/goal
+      goal_topic: {}
 
   plan_executor:
     ros__parameters:
       use_sim_time: true
-      xy_goal_tolerance: 0.2
-      yaw_goal_tolerance: 0.2
-      agent_num: 2
+      # Rewritten at launch time from warehouse_team_config.yaml.
+      agent_num: 0
       global_frame_id: map
+      global_plan_topic: global_plan
+      control_frequency: 10.0
+      interpolate_spacing: 0.1
+      lookahead_distance: 0.4
+      waypoint_tolerance: 0.15
+      goal_position_tolerance: 0.08
+      goal_yaw_tolerance: 0.08
+      pre_rotate_yaw_tolerance: 0.12
+      rotate_in_place_yaw_threshold: 0.45
+      slow_down_radius: 0.5
+      linear_kp: 1.0
+      angular_kp: 2.0
+      max_linear_speed: 0.5
+      max_angular_speed: 1.0
+      mapf_step_duration: 0.5
+      tracking_longitudinal_kp: 1.8
+      tracking_lateral_kp: 4.0
+      tracking_yaw_kp: 2.5
+      tracking_longitudinal_ki: 0.0
+      tracking_lateral_ki: 0.05
+      tracking_yaw_ki: 0.05
+      integral_limit: 0.4
 
-      agent_name:
-        agent_0: robot1
-        agent_1: robot2
+      # The custom tracker consumes MAPF global plans and publishes direct /cmd_vel.
+      cmd_vel_topic: {}
 
-      base_frame_id:
-        agent_0: robot1/base_link
-        agent_1: robot2/base_link
-
-      plan_topic:
-        agent_0: robot1/plan
-        agent_1: robot2/plan
+      base_frame_id: {}

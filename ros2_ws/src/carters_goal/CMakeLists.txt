@@ -30,6 +30,8 @@ install(PROGRAMS
   carters_goal/set_goal.py
   carters_goal/mapf_goal_publisher.py
   carters_goal/mapf_nav2_executor.py
+  carters_goal/mapf_path_tracker.py
+  carters_goal/mapf_timed_tracker.py
   carters_goal/namespaced_tf_bridge.py
   carters_goal/initial_pose_tf_publisher.py
   DESTINATION lib/${PROJECT_NAME}

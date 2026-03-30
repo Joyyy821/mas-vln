@@ -64,7 +64,11 @@ def _launch_setup(context, *args, **kwargs):
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_respawn = LaunchConfiguration("use_respawn")
 
+    initial_start_delay = float(LaunchConfiguration("initial_start_delay").perform(context))
     nav2_start_delay = float(LaunchConfiguration("nav2_start_delay").perform(context))
+    navigation_activation_delay = float(
+        LaunchConfiguration("navigation_activation_delay").perform(context)
+    )
     rviz_start_delay = float(LaunchConfiguration("rviz_start_delay").perform(context))
     startup_spacing = float(LaunchConfiguration("startup_spacing").perform(context))
 
@@ -100,7 +104,7 @@ def _launch_setup(context, *args, **kwargs):
             data=params,
         )
 
-        robot_start_offset = startup_spacing * index
+        robot_start_offset = initial_start_delay + (startup_spacing * index)
 
         nav_instances_cmds.append(
             GroupAction(
@@ -128,29 +132,29 @@ def _launch_setup(context, *args, **kwargs):
                         ],
                     ),
                     TimerAction(
-                        period=robot_start_offset + nav2_start_delay,
+                        period=robot_start_offset,
                         actions=[
                             IncludeLaunchDescription(
                                 PythonLaunchDescriptionSource(
                                     os.path.join(
                                         carter_nav2_bringup_dir,
                                         "launch",
-                                        "carter_navigation_individual.launch.py",
+                                        "carter_navigation_individual_staged.launch.py",
                                     )
                                 ),
                                 launch_arguments={
                                     "namespace": robot["name"],
-                                    "use_namespace": "True",
                                     "map": map_yaml_file,
                                     "use_sim_time": use_sim_time,
                                     "use_composition": "False",
                                     "use_respawn": use_respawn,
+                                    "localization_start_delay": str(nav2_start_delay),
+                                    "navigation_activation_delay": str(
+                                        navigation_activation_delay
+                                    ),
                                     "params_file": params_file,
                                     "default_bt_xml_filename": default_bt_xml_filename,
                                     "autostart": autostart,
-                                    "use_rviz": "False",
-                                    "use_simulator": "False",
-                                    "headless": "False",
                                 }.items(),
                             )
                         ],
@@ -161,7 +165,9 @@ def _launch_setup(context, *args, **kwargs):
                             LogInfo(
                                 msg=(
                                     f"Starting {robot['name']} pointcloud->scan bridge now, "
-                                    f"Nav2 after {nav2_start_delay:.1f}s, RViz after {rviz_start_delay:.1f}s."
+                                    f"localization after {nav2_start_delay:.1f}s, "
+                                    f"navigation after localization is active plus {navigation_activation_delay:.1f}s, "
+                                    f"RViz after {rviz_start_delay:.1f}s."
                                 )
                             ),
                             Node(
@@ -274,7 +280,19 @@ def generate_launch_description():
     declare_nav2_start_delay_cmd = DeclareLaunchArgument(
         "nav2_start_delay",
         default_value="2.0",
-        description="Seconds to wait after each robot's scan bridge starts before launching its Nav2 stack.",
+        description="Seconds to wait after each robot's scan bridge starts before launching map_server and AMCL.",
+    )
+
+    declare_initial_start_delay_cmd = DeclareLaunchArgument(
+        "initial_start_delay",
+        default_value="10.0",
+        description="Seconds to wait before starting the first robot. Later robots still use startup_spacing.",
+    )
+
+    declare_navigation_activation_delay_cmd = DeclareLaunchArgument(
+        "navigation_activation_delay",
+        default_value="8.0",
+        description="Additional seconds to wait after localization startup before launching planner, controller, and costmaps.",
     )
 
     declare_rviz_start_delay_cmd = DeclareLaunchArgument(
@@ -311,7 +329,9 @@ def generate_launch_description():
             declare_use_rviz_cmd,
             declare_autostart_cmd,
             declare_use_respawn_cmd,
+            declare_initial_start_delay_cmd,
             declare_nav2_start_delay_cmd,
+            declare_navigation_activation_delay_cmd,
             declare_rviz_start_delay_cmd,
             declare_startup_spacing_cmd,
             declare_rviz_config_file_cmd,

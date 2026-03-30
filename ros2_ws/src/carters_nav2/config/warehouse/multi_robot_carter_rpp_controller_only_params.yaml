@@ -1,0 +1,87 @@
+# Controller-only Nav2 template used by warehouse_team_lightweight.launch.py.
+# The launch file fills in the robot namespace from warehouse_team_config.yaml.
+
+controller_server:
+  ros__parameters:
+    use_sim_time: True
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    odom_topic: "chassis/odom"
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["stopped_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.2
+      movement_time_allowance: 20.0
+
+    stopped_goal_checker:
+      plugin: "nav2_controller::StoppedGoalChecker"
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 6.28318530718
+      stateful: False
+
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.45
+      lookahead_dist: 0.7
+      min_lookahead_dist: 0.35
+      max_lookahead_dist: 1.0
+      lookahead_time: 1.5
+      transform_tolerance: 0.2
+      use_velocity_scaled_lookahead_dist: false
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.8
+      use_collision_detection: false
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: false
+      use_fixed_curvature_lookahead: false
+      use_rotate_to_heading: false
+      rotate_to_heading_min_angle: 0.5
+      rotate_to_heading_angular_vel: 0.7
+      max_angular_accel: 1.5
+      allow_reversing: false
+      use_interpolation: true
+
+controller_server_rclcpp_node:
+  ros__parameters:
+    use_sim_time: True
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: True
+      footprint_padding: 0.25
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: True
+      width: 12
+      height: 12
+      resolution: 0.05
+      publish_frequency: 2.0
+      update_frequency: 5.0
+      transform_tolerance: 0.3
+      footprint: "[ [0.14, 0.25], [0.14, -0.25], [-0.607, -0.25], [-0.607, 0.25] ]"
+      plugins: ["inflation_layer"]
+      always_send_full_costmap: true
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: True
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.8
+  local_costmap_client:
+    ros__parameters:
+      use_sim_time: True
+  local_costmap_rclcpp_node:
+    ros__parameters:
+      use_sim_time: True
+
+lifecycle_manager_controller:
+  ros__parameters:
+    use_sim_time: True
+    autostart: True
+    node_names: ["controller_server"]

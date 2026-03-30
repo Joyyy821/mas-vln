@@ -210,13 +210,15 @@ def render_nav2_params(
     params = copy.deepcopy(load_yaml_file(template_path))
     params = _replace_robot_namespace(params, template_namespace, robot_namespace)
 
-    initial_pose_dict = pose_array_to_pose_dict(initial_pose)
-    params["amcl"]["ros__parameters"]["initial_pose"] = {
-        "x": initial_pose_dict["x"],
-        "y": initial_pose_dict["y"],
-        "z": initial_pose_dict["z"],
-        "yaw": initial_pose_dict["yaw"],
-    }
+    amcl_params = params.get("amcl", {}).get("ros__parameters")
+    if amcl_params is not None:
+        initial_pose_dict = pose_array_to_pose_dict(initial_pose)
+        amcl_params["initial_pose"] = {
+            "x": initial_pose_dict["x"],
+            "y": initial_pose_dict["y"],
+            "z": initial_pose_dict["z"],
+            "yaw": initial_pose_dict["yaw"],
+        }
     return params
 
 

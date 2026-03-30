@@ -7,13 +7,19 @@ Isaac Sim 5.1 stage builder:
 - (optional) saves the stage
 
 Run standalone:
-  ./python.sh /abs/path/to/build_stage_warehouse_carters.py
+  ./python.sh /abs/path/to/build_stage_warehouse_carters.py \
+    --team-config-file /abs/path/to/warehouse_team_config.yaml
 
-Env vars (recommended):
+CLI args (preferred):
+  --team-config-file /abs/path/to/warehouse_team_config.yaml
+  --output-usd /home/you/.../warehouse_two_robots.usd
+
+Env vars (fallback):
   export CARTER_TEAM_CONFIG_FILE="/abs/path/to/warehouse_team_config.yaml"
   export OUTPUT_USD="/home/you/.../warehouse_two_robots.usd"
 """
 
+import argparse
 import importlib.util
 import os
 from typing import Tuple
@@ -54,8 +60,8 @@ DEFAULT_TEAM_CONFIG_FILE = os.path.join(
     "warehouse",
     "warehouse_team_config.yaml",
 )
-TEAM_CONFIG_FILE = os.environ.get("CARTER_TEAM_CONFIG_FILE", DEFAULT_TEAM_CONFIG_FILE)
-OUTPUT_USD = os.environ.get("OUTPUT_USD", "")  # optional
+ENV_TEAM_CONFIG_FILE = os.environ.get("CARTER_TEAM_CONFIG_FILE", DEFAULT_TEAM_CONFIG_FILE)
+ENV_OUTPUT_USD = os.environ.get("OUTPUT_USD", "")  # optional
 
 
 def _load_team_config_utils():
@@ -69,6 +75,42 @@ def _load_team_config_utils():
 
 
 team_config_utils = _load_team_config_utils()
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build the Isaac Sim warehouse stage using a shared Carter team configuration. "
+            "CLI arguments override the environment-variable defaults."
+        )
+    )
+    parser.add_argument(
+        "--team-config-file",
+        default=ENV_TEAM_CONFIG_FILE,
+        help=(
+            "Full path to the shared team configuration YAML. "
+            "Defaults to CARTER_TEAM_CONFIG_FILE or the repo's warehouse_team_config.yaml."
+        ),
+    )
+    parser.add_argument(
+        "--output-usd",
+        default=ENV_OUTPUT_USD,
+        help=(
+            "Optional output USD path. Defaults to OUTPUT_USD when set."
+        ),
+    )
+    args, unknown = parser.parse_known_args()
+
+    team_config_file = os.path.abspath(os.path.expanduser(args.team_config_file))
+    if not os.path.exists(team_config_file):
+        raise FileNotFoundError(f"Team config file not found: {team_config_file}")
+
+    output_usd = os.path.abspath(os.path.expanduser(args.output_usd)) if args.output_usd else ""
+
+    if unknown:
+        print(f"[INFO] Ignoring unknown CLI args passed through Isaac Sim: {unknown}")
+
+    return team_config_file, output_usd
 
 
 ##########################################
@@ -407,10 +449,10 @@ def _print_prim_inputs(prim_path: str):
 ##########################################
 
 
-def build_stage():
+def build_stage(team_config_file: str, output_usd: str):
     from isaacsim.storage.native import get_assets_root_path
     assets_root_path = get_assets_root_path()
-    team_config = team_config_utils.load_team_config(TEAM_CONFIG_FILE, maps_dir=MAPS_DIR)
+    team_config = team_config_utils.load_team_config(team_config_file, maps_dir=MAPS_DIR)
 
     _new_stage()
     _set_stage_units(1.0)
@@ -449,14 +491,14 @@ def build_stage():
     _ensure_global_ros2_clock_graph("/clock")
 
     # 4) Save (optional)
-    if OUTPUT_USD:
+    if output_usd:
         import omni.usd
-        omni.usd.get_context().save_as_stage(OUTPUT_USD)
-        print(f"[OK] Saved stage to: {OUTPUT_USD}")
+        omni.usd.get_context().save_as_stage(output_usd)
+        print(f"[OK] Saved stage to: {output_usd}")
 
     print(
         "[OK] Stage built: warehouse + "
-        f"{team_config['agent_num']} Nova_Carter_ROS robots from {TEAM_CONFIG_FILE}"
+        f"{team_config['agent_num']} Nova_Carter_ROS robots from {team_config_file}"
     )
 
     # debug camera topic collisions
@@ -466,13 +508,14 @@ def build_stage():
 
 
 def main():
+    team_config_file, output_usd = _parse_args()
     sim_app = _maybe_start_sim_app()
     # warm-up updates
     for _ in range(10):
         sim_app.update()
 
     try:
-        build_stage()
+        build_stage(team_config_file, output_usd)
 
         # one or two updates after stage creation helps graphs/materialization settle
         for _ in range(10):

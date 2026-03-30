@@ -30,6 +30,7 @@ class MapfGoalPublisher(Node):
         self.declare_parameter("wait_for_mapf_active", True)
         self.declare_parameter("stop_on_plan", True)
         self.declare_parameter("global_plan_topic", "/mapf_base/global_plan")
+        self.declare_parameter("min_global_plan_subscribers", 1)
         self.declare_parameter(
             "mapf_transition_topic", "/mapf_base/mapf_base_node/transition_event"
         )
@@ -44,6 +45,9 @@ class MapfGoalPublisher(Node):
         self._wait_for_mapf_active = bool(self.get_parameter("wait_for_mapf_active").value)
         self._stop_on_plan = bool(self.get_parameter("stop_on_plan").value)
         self._global_plan_topic = self.get_parameter("global_plan_topic").value
+        self._min_global_plan_subscribers = int(
+            self.get_parameter("min_global_plan_subscribers").value
+        )
         self._mapf_transition_topic = self.get_parameter("mapf_transition_topic").value
 
         period = float(self.get_parameter("publish_period_sec").value)
@@ -85,6 +89,7 @@ class MapfGoalPublisher(Node):
         self._publish_idx = 0
         self._waiting_logged = False
         self._waiting_for_active_logged = False
+        self._waiting_for_plan_subscribers_logged = False
         self._timer = self.create_timer(period, self._timer_callback)
 
     def _build_pose_array(self, flat_goal_array: List[float]) -> PoseArray:
@@ -175,6 +180,19 @@ class MapfGoalPublisher(Node):
                     self._waiting_logged = True
                 return
             self._waiting_logged = False
+
+        if self._stop_on_plan and self._min_global_plan_subscribers > 0:
+            global_plan_sub_count = self.count_subscribers(self._global_plan_topic)
+            if global_plan_sub_count < self._min_global_plan_subscribers:
+                if not self._waiting_for_plan_subscribers_logged:
+                    self.get_logger().info(
+                        "Waiting for subscribers on "
+                        f"{self._global_plan_topic} before publishing goals "
+                        f"({global_plan_sub_count}/{self._min_global_plan_subscribers})."
+                    )
+                    self._waiting_for_plan_subscribers_logged = True
+                return
+            self._waiting_for_plan_subscribers_logged = False
 
         if self._plan_received:
             return

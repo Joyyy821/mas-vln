@@ -28,6 +28,9 @@ setup(
             "NamespacedTfBridge = carters_goal.namespaced_tf_bridge:main",
             "InitialPoseTfPublisher = carters_goal.initial_pose_tf_publisher:main",
             "MapfNav2Executor = carters_goal.mapf_nav2_executor:main",
+            "MapfPathTracker = carters_goal.mapf_path_tracker:main",
+            "MapfTimedTracker = carters_goal.mapf_timed_tracker:main",
+            "PlotMapfTrackingLogs = carters_goal.plot_mapf_tracking_logs:main",
         ]
     },
 )

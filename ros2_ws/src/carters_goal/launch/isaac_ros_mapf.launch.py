@@ -16,13 +16,20 @@ from launch_ros.actions import Node
 
 
 ############################################################################
-#### Launch warehouse MAPF demo with nav2 path follower: ###################
+#### Launch warehouse MAPF demo with direct path tracking: #################
 # 1. Start Isaac Sim on the host machine.
 #    $ ./python.sh /path/to/mas-vln/isaac_sim/scripts/build_stage_warehouse_carters.py
-# 2. Launch the Nav2 side with the same team config.
+# 2. Optionally launch lightweight RViz/scan debug helpers with the same team config.
+#    $ ros2 launch carters_nav2 warehouse_team_lightweight.launch.py
+#    The full Nav2 bringup remains available if you still want to compare behavior.
 #    $ ros2 launch carters_nav2 warehouse_two_carters_nav2.launch.py
 # 3. Launch MAPF execution with the same team config.
-#    $ ros2 launch carters_goal isaac_ros_mapf.launch.py run_plan_executor:=true
+#    Custom tracker:
+#    $ ros2 launch carters_goal isaac_ros_mapf.launch.py run_plan_executor:=true execution_backend:=tracker
+#    Time-aware custom tracker with shared pre-rotation barrier:
+#    $ ros2 launch carters_goal isaac_ros_mapf.launch.py run_plan_executor:=true execution_backend:=timed_tracker
+#    Nav2 controller-only FollowPath:
+#    $ ros2 launch carters_goal isaac_ros_mapf.launch.py run_plan_executor:=true execution_backend:=nav2
 ############################################################################
 
 
@@ -61,12 +68,17 @@ def _launch_setup(context, *args, **kwargs):
             "or pass map:=/abs/path/to/map.yaml."
         )
 
-    agent_name_map = {
-        f"agent_{index}": namespace for index, namespace in enumerate(robot_namespaces)
-    }
     base_frame_map = team_config_utils.build_agent_indexed_map(robot_namespaces, "base_link")
     plan_topic_map = team_config_utils.build_agent_indexed_map(robot_namespaces, "plan")
     goal_topic_map = team_config_utils.build_agent_indexed_map(robot_namespaces, "goal")
+    cmd_vel_topic_map = team_config_utils.build_agent_indexed_map(
+        robot_namespaces,
+        "cmd_vel",
+        leading_slash=True,
+    )
+    agent_name_map = {
+        f"agent_{index}": namespace for index, namespace in enumerate(robot_namespaces)
+    }
 
     mapf_params = team_config_utils.load_yaml_file(mapf_params_path)
     mapf_params["mapf_base"]["mapf_base_node"]["ros__parameters"]["agent_num"] = agent_num
@@ -75,9 +87,18 @@ def _launch_setup(context, *args, **kwargs):
     mapf_params["mapf_base"]["goal_transformer"]["ros__parameters"]["agent_num"] = agent_num
     mapf_params["mapf_base"]["goal_transformer"]["ros__parameters"]["goal_topic"] = goal_topic_map
     mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["agent_num"] = agent_num
-    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["agent_name"] = agent_name_map
     mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["base_frame_id"] = base_frame_map
-    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["plan_topic"] = plan_topic_map
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["cmd_vel_topic"] = (
+        cmd_vel_topic_map
+    )
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["agent_name"] = agent_name_map
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["controller_id"] = "FollowPath"
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["goal_checker_id"] = (
+        "stopped_goal_checker"
+    )
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["progress_checker_id"] = (
+        "progress_checker"
+    )
     generated_mapf_params = team_config_utils.write_temp_yaml("carters_goal_mapf_", mapf_params)
 
     costmap_params = team_config_utils.load_yaml_file(costmap_params_path)
@@ -112,6 +133,16 @@ def _launch_setup(context, *args, **kwargs):
     run_initial_pose_tf = LaunchConfiguration("run_initial_pose_tf")
     run_plan_executor = LaunchConfiguration("run_plan_executor")
     plan_executor_delay = LaunchConfiguration("plan_executor_delay")
+    execution_backend = LaunchConfiguration("execution_backend").perform(context).strip().lower()
+    run_plan_executor_enabled = (
+        LaunchConfiguration("run_plan_executor").perform(context).strip().lower() == "true"
+    )
+
+    executor_executable = "MapfPathTracker"
+    if execution_backend == "nav2":
+        executor_executable = "MapfNav2Executor"
+    elif execution_backend == "timed_tracker":
+        executor_executable = "MapfTimedTracker"
 
     lifecycle_nodes = ["map_server", "mapf_base_node"]
 
@@ -217,6 +248,7 @@ def _launch_setup(context, *args, **kwargs):
                         "wait_for_subscribers": True,
                         "wait_for_mapf_active": True,
                         "stop_on_plan": True,
+                        "min_global_plan_subscribers": 1 if run_plan_executor_enabled else 1,
                         "agent_num": agent_num,
                         "goal_array": team_config["goal_pose_array"],
                     }
@@ -231,7 +263,7 @@ def _launch_setup(context, *args, **kwargs):
             Node(
                 namespace="mapf_base",
                 package="carters_goal",
-                executable="MapfNav2Executor",
+                executable=executor_executable,
                 name="plan_executor",
                 output="screen",
                 condition=IfCondition(run_plan_executor),
@@ -335,12 +367,21 @@ def generate_launch_description():
     run_plan_executor_arg = DeclareLaunchArgument(
         "run_plan_executor",
         default_value="false",
-        description="Execute sparse MAPF plans through Nav2 FollowPath servers.",
+        description="Execute MAPF plans with the selected execution backend.",
+    )
+    execution_backend_arg = DeclareLaunchArgument(
+        "execution_backend",
+        default_value="tracker",
+        description=(
+            "Execution backend: 'tracker' for the legacy path tracker, "
+            "'timed_tracker' for time-aware cmd_vel tracking with a shared pre-rotation barrier, "
+            "or 'nav2' for FollowPath."
+        ),
     )
     plan_executor_delay_arg = DeclareLaunchArgument(
         "plan_executor_delay",
-        default_value="5.0",
-        description="Seconds to wait before starting the Nav2 FollowPath executor.",
+        default_value="1.5",
+        description="Seconds to wait before starting the selected MAPF executor.",
     )
 
     return LaunchDescription(
@@ -360,6 +401,7 @@ def generate_launch_description():
             run_tf_bridge_arg,
             run_initial_pose_tf_arg,
             run_plan_executor_arg,
+            execution_backend_arg,
             plan_executor_delay_arg,
             OpaqueFunction(function=_launch_setup),
         ]
