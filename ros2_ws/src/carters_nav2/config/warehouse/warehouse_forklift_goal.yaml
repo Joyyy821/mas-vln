@@ -1,0 +1,40 @@
+environment:
+  nav2_map: carter_warehouse_navigation.yaml
+  mapf_map: carter_warehouse_navigation_mapf.yaml
+
+robots:
+  - name: robot1
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+    goal_pose:
+      x: 4.451694011688232
+      y: -4.15500545501709
+      z: -4.76837158203125e-07
+      yaw: 1.8971063755599689
+
+  - name: robot2
+    initial_pose:
+      x: -2.5
+      y: 0.0
+      z: 0.0
+      yaw: 3.14159
+    goal_pose:
+      x: 2.898484230041504
+      y: -0.34622716903686507
+      z: -1.9371509552001953e-07
+      yaw: -1.1887125979191429
+
+  - name: robot3
+    initial_pose:
+      x: 0.0
+      y: 2.5
+      z: 0.0
+      yaw: 1.57079632679
+    goal_pose:
+      x: 5.703395366668701
+      y: -0.6980133652687074
+      z: -4.76837158203125e-07
+      yaw: -2.612293712749975

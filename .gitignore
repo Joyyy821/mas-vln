@@ -4,3 +4,4 @@ log
 __pycache__
 *.pyc
 experiments/
+isaac_sim/vlm-caption-data/
