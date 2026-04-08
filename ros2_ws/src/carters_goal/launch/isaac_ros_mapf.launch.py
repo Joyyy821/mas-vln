@@ -125,6 +125,10 @@ def _launch_setup(context, *args, **kwargs):
     use_sim_time = LaunchConfiguration("use_sim_time")
     autostart = LaunchConfiguration("autostart")
     mapf_planner = LaunchConfiguration("mapf_planner")
+    record_velocity = LaunchConfiguration("record_velocity")
+    record_frequency_hz = LaunchConfiguration("record_frequency_hz")
+    record_odom_topic_suffix = LaunchConfiguration("record_odom_topic_suffix")
+    experiments_dir = LaunchConfiguration("experiments_dir")
     core_startup_delay = LaunchConfiguration("core_startup_delay")
     lifecycle_manager_delay = LaunchConfiguration("lifecycle_manager_delay")
     run_goal_publisher = LaunchConfiguration("run_goal_publisher")
@@ -221,6 +225,24 @@ def _launch_setup(context, *args, **kwargs):
         parameters=[generated_initial_pose_tf_params, {"use_sim_time": use_sim_time}],
     )
 
+    velocity_recorder = Node(
+        package="carters_goal",
+        executable="RobotVelocityRecorder",
+        name="robot_velocity_recorder",
+        output="screen",
+        condition=IfCondition(record_velocity),
+        parameters=[
+            {
+                "use_sim_time": use_sim_time,
+                "team_config_file": team_config_path,
+                "robot_namespaces": robot_namespaces,
+                "odom_topic_suffix": record_odom_topic_suffix,
+                "record_frequency_hz": record_frequency_hz,
+                "experiments_dir": experiments_dir,
+            }
+        ],
+    )
+
     mapf_core_startup = TimerAction(period=core_startup_delay, actions=[mapf_core_group])
 
     lifecycle_manager_startup = TimerAction(
@@ -273,6 +295,7 @@ def _launch_setup(context, *args, **kwargs):
     )
 
     return [
+        velocity_recorder,
         tf_bridge,
         initial_pose_tf_publisher,
         mapf_core_startup,
@@ -334,6 +357,32 @@ def generate_launch_description():
         default_value="mapf_planner/CBSROS",
         description="MAPF planner plugin name.",
     )
+    record_velocity_arg = DeclareLaunchArgument(
+        "record_velocity",
+        default_value="false",
+        description="Record time-stamped simulator odometry velocities for each robot.",
+    )
+    record_frequency_arg = DeclareLaunchArgument(
+        "record_frequency_hz",
+        default_value="20.0",
+        description=(
+            "Maximum write frequency for velocity recording. "
+            "Set to 0 to record every odometry message."
+        ),
+    )
+    record_odom_topic_suffix_arg = DeclareLaunchArgument(
+        "record_odom_topic_suffix",
+        default_value="chassis/odom",
+        description="Robot-relative odometry topic suffix used as the simulator velocity source.",
+    )
+    experiments_dir_arg = DeclareLaunchArgument(
+        "experiments_dir",
+        default_value="",
+        description=(
+            "Optional override for the experiments directory. "
+            "Defaults to <repo>/experiments."
+        ),
+    )
     core_startup_delay_arg = DeclareLaunchArgument(
         "core_startup_delay",
         default_value="1.0",
@@ -394,6 +443,10 @@ def generate_launch_description():
             use_sim_time_arg,
             autostart_arg,
             mapf_planner_arg,
+            record_velocity_arg,
+            record_frequency_arg,
+            record_odom_topic_suffix_arg,
+            experiments_dir_arg,
             core_startup_delay_arg,
             lifecycle_manager_delay_arg,
             run_goal_pub_arg,

@@ -30,6 +30,7 @@ setup(
             "MapfNav2Executor = carters_goal.mapf_nav2_executor:main",
             "MapfPathTracker = carters_goal.mapf_path_tracker:main",
             "MapfTimedTracker = carters_goal.mapf_timed_tracker:main",
+            "RobotVelocityRecorder = carters_goal.robot_velocity_recorder:main",
             "PlotMapfTrackingLogs = carters_goal.plot_mapf_tracking_logs:main",
         ]
     },
