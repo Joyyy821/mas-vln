@@ -1,5 +1,19 @@
 # Data Collection Pipeline for MAS VLN
 
+## Installation
+Tested version: Isaac Sim 5.1 + ROS 2 humble on Ubuntu 22.04
+
+Clone the repo under your Isaac ROS docker mounted space, add MAPF support [here](https://github.com/Joyyy821/mapf_ros), and build the ROS packages.
+   
+```bash 
+git clone https://github.com/Joyyy821/mas-vln.git
+cd mas-vln/ros2_ws/src
+git clone https://github.com/Joyyy821/mapf_ros.git
+cd ..
+colcon build --symlink-install
+```
+Make sure to `source install/setup.bash` before launching.
+
 ## Customized team config bringup
 
 - `build_stage_warehouse_carters.py` accepts:
@@ -35,5 +49,7 @@ ros2 launch carters_nav2 warehouse_team_lightweight.launch.py \
 ros2 launch carters_goal isaac_ros_mapf.launch.py \
   team_config_file:=/workspaces/IsaacSim-ros_workspaces/humble_ws/src/mas-vln/ros2_ws/src/carters_nav2/config/warehouse/warehouse_team_config_2.yaml \
   run_plan_executor:=true \
-  execution_backend:=timed_tracker
+  execution_backend:=timed_tracker \
+  record_velocity:=true \
+  record_frequency_hz:=20.0
 ```
