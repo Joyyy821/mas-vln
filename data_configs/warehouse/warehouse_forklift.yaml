@@ -1,0 +1,185 @@
+language_instruction: 'Robot 1 and robot 2 go to both sides of the forklift, robot 3 goes to the back of the forklift, and all robots face towards the forklift.'
+environment:
+  nav2_map: carter_warehouse_navigation.yaml
+  mapf_map: carter_warehouse_navigation_mapf.yaml
+
+rollouts:
+  - id: 1
+    robots:
+      - name: robot1
+        initial_pose:
+          x: 0.0
+          y: 0.0
+          z: 0.0
+          yaw: 0.0
+        goal_pose:
+          x: 4.451694011688232
+          y: -4.15500545501709
+          z: -4.76837158203125e-07
+          yaw: 1.8971063755599689
+      - name: robot2
+        initial_pose:
+          x: -2.5
+          y: 0.0
+          z: 0.0
+          yaw: 3.14159
+        goal_pose:
+          x: 2.898484230041504
+          y: -0.34622716903686507
+          z: -1.9371509552001953e-07
+          yaw: -1.1887125979191429
+      - name: robot3
+        initial_pose:
+          x: 0.0
+          y: 2.5
+          z: 0.0
+          yaw: 1.57079632679
+        goal_pose:
+          x: 5.703395366668701
+          y: -0.6980133652687074
+          z: -4.76837158203125e-07
+          yaw: -2.612293712749975
+
+  - id: 2
+    robots:
+      - name: robot1
+        initial_pose:
+          x: 6.0
+          y: 6.0
+          z: 0.0
+          yaw: 3.14159
+        goal_pose:
+          x: 4.78543369596817
+          y: -3.774385184942107
+          z: -1.1920925047093078e-07
+          yaw: 2.2849539487968826
+      - name: robot2
+        initial_pose:
+          x: 6.0
+          y: 10.0
+          z: 0.0
+          yaw: 3.14159
+        goal_pose:
+          x: 2.8955195771247424
+          y: 0.38777086278016565
+          z: 1.3944401189291969e-13
+          yaw: -1.2633091213386973
+      - name: robot3
+        initial_pose:
+          x: 6.0
+          y: 14.0
+          z: 0.0
+          yaw: 3.14159
+        goal_pose:
+          x: 6.470203753256441
+          y: -0.4317939024506983
+          z: -3.278255906735694e-07
+          yaw: -3.031991723142902
+
+  - id: 3
+    robots:
+      - name: robot1
+        initial_pose:
+          x: -3.0
+          y: 15.0
+          z: 0.0
+          yaw: -1.57079632679
+        goal_pose:
+          x: 2.74951171875
+          y: 0.2513509690761566
+          z: -2.086162567138672e-07
+          yaw: -1.2237676381791163
+      - name: robot2
+        initial_pose:
+          x: 0.0
+          y: 15.0
+          z: 0.0
+          yaw: -1.57079632679
+        goal_pose:
+          x: 5.100868225097655
+          y: -2.5003509521484375
+          z: -3.8743019104003906e-07
+          yaw: 2.757889734881702
+      - name: robot3
+        initial_pose:
+          x: 3.0
+          y: 15.0
+          z: 0.0
+          yaw: -1.57079632679
+        goal_pose:
+          x: 5.519595908421081
+          y: 0.02989759957807849
+          z: -3.874300942285913e-07
+          yaw: -2.154840178383534
+
+  - id: 4
+    robots:
+      - name: robot1
+        initial_pose:
+          x: -3.0
+          y: 7.0
+          z: 0.0
+          yaw: 3.14159
+        goal_pose:
+          x: 1.9983638525009155
+          y: -1.187462449073791
+          z: -1.1920928954792459e-07
+          yaw: -0.7033195221950044
+      - name: robot2
+        initial_pose:
+          x: 0.0
+          y: 10.0
+          z: 0.0
+          yaw: 0.0
+        goal_pose:
+          x: 5.750576972961425
+          y: -2.9502854347229004
+          z: -6.556510925292969e-07
+          yaw: 2.682787374393467
+      - name: robot3
+        initial_pose:
+          x: 5.0
+          y: 6.0
+          z: 0.0
+          yaw: 1.57079632679
+        goal_pose:
+          x: 6.4126577377319345
+          y: -1.2554441690444946
+          z: -6.407499313354492e-07
+          yaw: 3.0868889792866083
+
+  - id: 5
+    robots:
+      - name: robot1
+        initial_pose:
+          x: 3.0
+          y: 10.5
+          z: 0.0
+          yaw: 0.0
+        goal_pose:
+          x: 4.819201469421387
+          y: -3.6267857551574703
+          z: -3.8743019104003906e-07
+          yaw: 2.367273234501673
+      - name: robot2
+        initial_pose:
+          x: -0.5
+          y: 4.5
+          z: 0.0
+          yaw: 3.14159
+        goal_pose:
+          x: 2.463868379592896
+          y: -0.4328061938285829
+          z: -1.4901161193847656e-07
+          yaw: -1.0476536697756687
+      - name: robot3
+        initial_pose:
+          x: -3.5
+          y: 11.5
+          z: 0.0
+          yaw: -1.57079632679
+        goal_pose:
+          x: 5.7584447860717765
+          y: -0.5392932295799258
+          z: -7.599592208862305e-07
+          yaw: -2.4991766012821492
