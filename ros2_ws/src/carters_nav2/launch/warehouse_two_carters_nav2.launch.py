@@ -221,7 +221,7 @@ def generate_launch_description():
             carter_nav2_bringup_dir,
             "config",
             "warehouse",
-            "warehouse_team_config.yaml",
+            "warehouse_forklift.yaml",
         ),
         description="Full path to the shared robot team configuration YAML.",
     )

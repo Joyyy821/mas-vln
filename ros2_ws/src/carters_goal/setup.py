@@ -31,6 +31,7 @@ setup(
             "MapfPathTracker = carters_goal.mapf_path_tracker:main",
             "MapfTimedTracker = carters_goal.mapf_timed_tracker:main",
             "RobotVelocityRecorder = carters_goal.robot_velocity_recorder:main",
+            "RolloutManager = carters_goal.rollout_manager:main",
             "PlotMapfTrackingLogs = carters_goal.plot_mapf_tracking_logs:main",
         ]
     },

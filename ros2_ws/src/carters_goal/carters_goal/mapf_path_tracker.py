@@ -13,6 +13,7 @@ from mapf_msgs.msg import GlobalPlan
 from nav_msgs.msg import Path
 from rclpy.node import Node
 from rclpy.time import Time
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -35,6 +36,10 @@ class MapfPathTracker(Node):
         self.declare_parameter("angular_kp", 2.0)
         self.declare_parameter("max_linear_speed", 0.5)
         self.declare_parameter("max_angular_speed", 1.0)
+        self.declare_parameter("execution_status_topic", "/mapf_base/plan_execution_status")
+        self.declare_parameter("rollout_control_topic", "")
+        self.declare_parameter("team_config_file", "")
+        self.declare_parameter("experiments_dir", "")
 
         self._agent_num = int(self.get_parameter("agent_num").value)
         self._global_frame_id = str(self.get_parameter("global_frame_id").value)
@@ -55,6 +60,7 @@ class MapfPathTracker(Node):
         self._angular_kp = float(self.get_parameter("angular_kp").value)
         self._max_linear_speed = float(self.get_parameter("max_linear_speed").value)
         self._max_angular_speed = float(self.get_parameter("max_angular_speed").value)
+        self._execution_status_topic = str(self.get_parameter("execution_status_topic").value)
 
         self._base_frame_ids: List[str] = []
         self._cmd_vel_topics: List[str] = []
@@ -87,6 +93,9 @@ class MapfPathTracker(Node):
             self._plan_callback,
             1,
         )
+        self._execution_status_pub = self.create_publisher(
+            String, self._execution_status_topic, 10
+        )
         self._control_timer = self.create_timer(1.0 / self._control_frequency, self._control_loop)
         self.get_logger().info(
             "Initialized custom MAPF path tracker on "
@@ -112,6 +121,7 @@ class MapfPathTracker(Node):
         self._path_indices = [0 for _ in range(self._agent_num)]
         self._goal_reached = [len(path) == 0 for path in self._paths]
         self._has_active_plan = any(not reached for reached in self._goal_reached)
+        self._publish_execution_status("active")
 
         path_sizes = ", ".join(str(len(path)) for path in self._paths)
         self.get_logger().info(
@@ -139,7 +149,9 @@ class MapfPathTracker(Node):
         if all(self._goal_reached):
             self.get_logger().info("Finished executing MAPF plan with custom path tracker.")
             self._has_active_plan = False
+            self._current_plan = None
             self._publish_zero_to_all()
+            self._publish_execution_status("succeeded")
 
     def _lookup_robot_pose(self, agent_idx: int) -> tuple[float, float, float] | None:
         try:
@@ -297,6 +309,11 @@ class MapfPathTracker(Node):
     def _publish_zero_to_all(self) -> None:
         for agent_idx in range(self._agent_num):
             self._publish_zero(agent_idx)
+
+    def _publish_execution_status(self, status: str) -> None:
+        msg = String()
+        msg.data = status
+        self._execution_status_pub.publish(msg)
 
     def _yaw_to_quaternion(self, yaw: float) -> Quaternion:
         quat = Quaternion()

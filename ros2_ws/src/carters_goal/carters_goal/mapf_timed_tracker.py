@@ -8,14 +8,19 @@ import copy
 import math
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, Quaternion, Twist
+from geometry_msgs.msg import PoseArray, PoseStamped, Quaternion, Twist
 from mapf_msgs.msg import GlobalPlan, SinglePlan
 from rclpy.node import Node
 from rclpy.time import Time
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
+
+from carters_goal.rollout_control import parse_rollout_id
+from carters_goal.shared_team_config import rollout_run_dir
 
 
 @dataclass
@@ -126,6 +131,10 @@ class MapfTimedTracker(Node):
         self.declare_parameter("max_angular_speed", 1.0)
         self.declare_parameter("save_tracking_log", True)
         self.declare_parameter("tracking_log_dir", "/tmp/mapf_timed_tracker")
+        self.declare_parameter("execution_status_topic", "/mapf_base/plan_execution_status")
+        self.declare_parameter("rollout_control_topic", "")
+        self.declare_parameter("team_config_file", "")
+        self.declare_parameter("experiments_dir", "")
 
         self._agent_num = int(self.get_parameter("agent_num").value)
         self._global_frame_id = str(self.get_parameter("global_frame_id").value)
@@ -155,6 +164,13 @@ class MapfTimedTracker(Node):
         self._max_angular_speed = float(self.get_parameter("max_angular_speed").value)
         self._save_tracking_log = bool(self.get_parameter("save_tracking_log").value)
         self._tracking_log_dir = str(self.get_parameter("tracking_log_dir").value)
+        self._default_tracking_log_dir = self._tracking_log_dir
+        self._execution_status_topic = str(self.get_parameter("execution_status_topic").value)
+        self._rollout_control_topic = str(self.get_parameter("rollout_control_topic").value).strip()
+        team_config_file = str(self.get_parameter("team_config_file").value).strip()
+        self._team_config_path = Path(team_config_file).expanduser().resolve() if team_config_file else None
+        self._experiments_dir = str(self.get_parameter("experiments_dir").value).strip()
+        self._active_rollout_id: int | None = None
 
         self._agent_names: List[str] = []
         self._base_frame_ids: List[str] = []
@@ -205,6 +221,17 @@ class MapfTimedTracker(Node):
             self._plan_callback,
             1,
         )
+        self._execution_status_pub = self.create_publisher(
+            String, self._execution_status_topic, 10
+        )
+        self._rollout_control_sub = None
+        if self._rollout_control_topic:
+            self._rollout_control_sub = self.create_subscription(
+                PoseArray,
+                self._rollout_control_topic,
+                self._rollout_control_callback,
+                10,
+            )
         self._startup_timer = self.create_timer(0.5, self._start_pending_plan)
         self._control_timer = self.create_timer(1.0 / self._control_frequency, self._control_loop)
         self.get_logger().info(
@@ -254,6 +281,7 @@ class MapfTimedTracker(Node):
         self._tracking_summary_logged = [False for _ in range(self._agent_num)]
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
         self._reset_all_integrators()
+        self._publish_execution_status("active")
 
         durations = []
         for agent_idx in range(self._agent_num):
@@ -276,6 +304,7 @@ class MapfTimedTracker(Node):
             f"Loaded timed MAPF plan with per-agent translation durations [{duration_text}]. "
             "Waiting for all agents to finish pre-rotation before starting the shared clock."
         )
+        self._log_reference_separation()
 
         if all(self._pre_rotate_complete):
             self._start_translation_phase(self.get_clock().now())
@@ -365,7 +394,36 @@ class MapfTimedTracker(Node):
             self._translation_started = False
             self._current_plan = None
             self._publish_zero_to_all()
+            self._publish_execution_status("succeeded")
             self._start_pending_plan()
+
+    def _reset_execution_state(self, reason: str | None = None) -> None:
+        had_execution_state = (
+            self._active
+            or self._current_plan is not None
+            or self._pending_plan is not None
+            or any(phase != "idle" for phase in self._phases)
+        )
+
+        self._active = False
+        self._translation_started = False
+        self._current_plan = None
+        self._pending_plan = None
+        self._trajectories = [None for _ in range(self._agent_num)]
+        self._phases = ["idle" for _ in range(self._agent_num)]
+        self._pre_rotate_complete = [False for _ in range(self._agent_num)]
+        self._completed = [False for _ in range(self._agent_num)]
+        self._trajectory_start_time = None
+        self._last_control_time = None
+        self._max_translation_duration = 0.0
+        self._tracking_error_stats = [TrackingErrorStats() for _ in range(self._agent_num)]
+        self._tracking_summary_logged = [False for _ in range(self._agent_num)]
+        self._tracking_log_rows = [[] for _ in range(self._agent_num)]
+        self._reset_all_integrators()
+        self._publish_zero_to_all()
+
+        if had_execution_state and reason:
+            self.get_logger().info(reason)
 
     def _start_translation_phase(self, now: Time) -> None:
         self._translation_started = True
@@ -381,6 +439,57 @@ class MapfTimedTracker(Node):
             "All agents finished pre-rotation. Starting the shared timed trajectory clock "
             f"at t=0.0s with a global translation horizon of {self._max_translation_duration:.2f}s."
         )
+
+    def _log_reference_separation(self) -> None:
+        active_agents = [
+            (agent_idx, trajectory)
+            for agent_idx, trajectory in enumerate(self._trajectories)
+            if trajectory is not None
+        ]
+        if len(active_agents) < 2:
+            return
+
+        sample_dt = max(min(self._mapf_step_duration / 5.0, 0.1), 0.02)
+        global_min_distance = float("inf")
+        global_min_pair = None
+        global_min_time = 0.0
+
+        for left_index in range(len(active_agents) - 1):
+            left_agent_idx, left_trajectory = active_agents[left_index]
+            for right_index in range(left_index + 1, len(active_agents)):
+                right_agent_idx, right_trajectory = active_agents[right_index]
+                elapsed = 0.0
+                pair_min_distance = float("inf")
+                pair_min_time = 0.0
+                while elapsed <= self._max_translation_duration + 1e-6:
+                    left_ref = self._sample_trajectory(left_trajectory, elapsed)
+                    right_ref = self._sample_trajectory(right_trajectory, elapsed)
+                    distance = self._distance(
+                        left_ref.x,
+                        left_ref.y,
+                        right_ref.x,
+                        right_ref.y,
+                    )
+                    if distance < pair_min_distance:
+                        pair_min_distance = distance
+                        pair_min_time = elapsed
+                    elapsed += sample_dt
+
+                self.get_logger().info(
+                    f"Reference separation agent {left_agent_idx} vs {right_agent_idx}: "
+                    f"min={pair_min_distance:.3f} m at t={pair_min_time:.2f}s."
+                )
+                if pair_min_distance < global_min_distance:
+                    global_min_distance = pair_min_distance
+                    global_min_pair = (left_agent_idx, right_agent_idx)
+                    global_min_time = pair_min_time
+
+        if global_min_pair is not None:
+            self.get_logger().info(
+                f"Minimum planned inter-agent separation: {global_min_distance:.3f} m "
+                f"between agent {global_min_pair[0]} and agent {global_min_pair[1]} "
+                f"at t={global_min_time:.2f}s."
+            )
 
     def _track_agent(
         self,
@@ -755,6 +864,43 @@ class MapfTimedTracker(Node):
     def _publish_zero_to_all(self) -> None:
         for agent_idx in range(self._agent_num):
             self._publish_zero(agent_idx)
+
+    def _publish_execution_status(self, status: str) -> None:
+        msg = String()
+        msg.data = status
+        self._execution_status_pub.publish(msg)
+
+    def _rollout_control_callback(self, msg: PoseArray) -> None:
+        rollout_id = parse_rollout_id(msg.header.frame_id)
+        if rollout_id is None:
+            return
+
+        if rollout_id <= 0:
+            self._reset_execution_state("Received rollout stop signal. Clearing timed tracker state.")
+            self._active_rollout_id = None
+            self._tracking_log_dir = self._default_tracking_log_dir
+            return
+
+        if self._active_rollout_id == rollout_id:
+            return
+
+        self._reset_execution_state(
+            f"Preparing timed tracker for rollout {rollout_id}. Clearing any stale execution state."
+        )
+        self._active_rollout_id = rollout_id
+        if self._team_config_path is None:
+            return
+
+        self._tracking_log_dir = str(
+            rollout_run_dir(
+                self._experiments_dir,
+                team_config_path=self._team_config_path,
+                rollout_id=rollout_id,
+            )
+        )
+        self.get_logger().info(
+            f"Tracking logs for rollout {rollout_id} will be written under {self._tracking_log_dir}."
+        )
 
     def _normalize_quaternion(self, quat_in: Quaternion) -> Quaternion:
         norm = math.sqrt(

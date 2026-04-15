@@ -133,30 +133,28 @@ def resolve_optional_path(path_value: str | None, base_dir: str | None) -> str |
     return os.path.normpath(os.path.join(base_dir, path_value))
 
 
-def load_team_config(team_config_path: str, maps_dir: str | None = None) -> dict[str, Any]:
-    config = load_yaml_file(team_config_path) or {}
-    robots_config = config.get("robots", [])
+def _normalize_robots_config(robots_config: Any, source_label: str) -> list[dict[str, Any]]:
     if not robots_config:
-        raise ValueError(f"No robots were configured in {team_config_path}.")
+        raise ValueError(f"No robots were configured in {source_label}.")
 
     robots: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     for index, robot_config in enumerate(robots_config):
         if not isinstance(robot_config, dict):
-            raise ValueError(f"Robot entry {index} in {team_config_path} must be a mapping.")
+            raise ValueError(f"Robot entry {index} in {source_label} must be a mapping.")
 
         name = str(robot_config.get("name", f"robot{index + 1}"))
         if name in seen_names:
-            raise ValueError(f"Robot name '{name}' is duplicated in {team_config_path}.")
+            raise ValueError(f"Robot name '{name}' is duplicated in {source_label}.")
         seen_names.add(name)
 
         initial_pose = pose_config_to_list(
             robot_config.get("initial_pose", robot_config.get("start_pose")),
-            f"robots[{index}].initial_pose",
+            f"{source_label}.robots[{index}].initial_pose",
         )
         goal_pose = pose_config_to_list(
             robot_config.get("goal_pose", robot_config.get("goal")),
-            f"robots[{index}].goal_pose",
+            f"{source_label}.robots[{index}].goal_pose",
         )
 
         robots.append(
@@ -167,19 +165,158 @@ def load_team_config(team_config_path: str, maps_dir: str | None = None) -> dict
             }
         )
 
+    return robots
+
+
+def _normalize_rollout_id(raw_rollout_id: Any, default_rollout_id: int, source_label: str) -> int:
+    if raw_rollout_id is None:
+        return default_rollout_id
+
+    try:
+        rollout_id = int(raw_rollout_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Rollout id in {source_label} must be an integer.") from exc
+
+    if rollout_id <= 0:
+        raise ValueError(f"Rollout id in {source_label} must be positive, got {rollout_id}.")
+    return rollout_id
+
+
+def _rollout_payload(
+    *,
+    rollout_id: int,
+    robots: list[dict[str, Any]],
+    rollout_index: int,
+) -> dict[str, Any]:
+    return {
+        "id": rollout_id,
+        "rollout_index": rollout_index,
+        "robots": robots,
+        "initial_pose_array": flatten_pose_arrays(robots, "initial_pose"),
+        "goal_pose_array": flatten_pose_arrays(robots, "goal_pose"),
+    }
+
+
+def load_multi_rollout_config(team_config_path: str, maps_dir: str | None = None) -> dict[str, Any]:
+    config = load_yaml_file(team_config_path) or {}
+
     environment = config.get("environment", {})
     nav2_map = resolve_optional_path(environment.get("nav2_map"), maps_dir)
     mapf_map = resolve_optional_path(environment.get("mapf_map"), maps_dir)
 
+    language_instruction = str(config.get("language_instruction", "") or "").strip()
+    raw_rollouts = config.get("rollouts")
+
+    canonical_rollouts: list[dict[str, Any]] = []
+    if raw_rollouts is None:
+        robots = _normalize_robots_config(config.get("robots", []), team_config_path)
+        canonical_rollouts.append(
+            _rollout_payload(
+                rollout_id=_normalize_rollout_id(config.get("id"), 1, team_config_path),
+                robots=robots,
+                rollout_index=0,
+            )
+        )
+    else:
+        if not isinstance(raw_rollouts, list) or not raw_rollouts:
+            raise ValueError(
+                f"'rollouts' in {team_config_path} must be a non-empty list when provided."
+            )
+
+        canonical_robot_names: list[str] | None = None
+        seen_rollout_ids: set[int] = set()
+        for rollout_index, rollout_config in enumerate(raw_rollouts):
+            if not isinstance(rollout_config, dict):
+                raise ValueError(
+                    f"Rollout entry {rollout_index} in {team_config_path} must be a mapping."
+                )
+
+            rollout_id = _normalize_rollout_id(
+                rollout_config.get("id"),
+                rollout_index + 1,
+                f"{team_config_path}.rollouts[{rollout_index}]",
+            )
+            if rollout_id in seen_rollout_ids:
+                raise ValueError(
+                    f"Rollout id '{rollout_id}' is duplicated in {team_config_path}."
+                )
+            seen_rollout_ids.add(rollout_id)
+
+            robots = _normalize_robots_config(
+                rollout_config.get("robots", []),
+                f"{team_config_path}.rollouts[{rollout_index}]",
+            )
+            rollout_robot_names = [robot["name"] for robot in robots]
+            if canonical_robot_names is None:
+                canonical_robot_names = rollout_robot_names
+            else:
+                if set(rollout_robot_names) != set(canonical_robot_names):
+                    raise ValueError(
+                        "Every rollout must define the same robot namespaces. "
+                        f"Expected {canonical_robot_names}, got {rollout_robot_names} in "
+                        f"{team_config_path}.rollouts[{rollout_index}]."
+                    )
+                robot_by_name = {robot["name"]: robot for robot in robots}
+                robots = [robot_by_name[name] for name in canonical_robot_names]
+
+            canonical_rollouts.append(
+                _rollout_payload(
+                    rollout_id=rollout_id,
+                    robots=robots,
+                    rollout_index=rollout_index,
+                )
+            )
+
+    first_rollout = canonical_rollouts[0]
+
     return {
         "team_config_path": team_config_path,
-        "robots": robots,
-        "robot_namespaces": [robot["name"] for robot in robots],
-        "agent_num": len(robots),
+        "language_instruction": language_instruction,
+        "environment": environment,
+        "rollouts": canonical_rollouts,
+        "rollout_ids": [rollout["id"] for rollout in canonical_rollouts],
+        "robot_namespaces": [robot["name"] for robot in first_rollout["robots"]],
+        "agent_num": len(first_rollout["robots"]),
         "nav2_map": nav2_map,
         "mapf_map": mapf_map,
-        "initial_pose_array": flatten_pose_arrays(robots, "initial_pose"),
-        "goal_pose_array": flatten_pose_arrays(robots, "goal_pose"),
+        "first_rollout": first_rollout,
+    }
+
+
+def load_team_config(
+    team_config_path: str,
+    maps_dir: str | None = None,
+    *,
+    rollout_id: int | None = None,
+    rollout_index: int = 0,
+) -> dict[str, Any]:
+    config = load_multi_rollout_config(team_config_path, maps_dir=maps_dir)
+    rollouts = config["rollouts"]
+
+    selected_rollout = None
+    if rollout_id is not None:
+        selected_rollout = next((rollout for rollout in rollouts if rollout["id"] == rollout_id), None)
+        if selected_rollout is None:
+            raise ValueError(
+                f"Rollout id {rollout_id} was not found in {team_config_path}. "
+                f"Available ids: {config['rollout_ids']}"
+            )
+    else:
+        if rollout_index < 0 or rollout_index >= len(rollouts):
+            raise IndexError(
+                f"rollout_index {rollout_index} is out of range for {team_config_path} "
+                f"({len(rollouts)} rollouts available)."
+            )
+        selected_rollout = rollouts[rollout_index]
+
+    return {
+        **config,
+        "selected_rollout": selected_rollout,
+        "rollout_id": selected_rollout["id"],
+        "rollout_index": selected_rollout["rollout_index"],
+        "robots": selected_rollout["robots"],
+        "initial_pose_array": selected_rollout["initial_pose_array"],
+        "goal_pose_array": selected_rollout["goal_pose_array"],
     }
 
 

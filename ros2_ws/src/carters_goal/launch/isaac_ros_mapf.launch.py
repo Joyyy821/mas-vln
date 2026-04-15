@@ -137,10 +137,14 @@ def _launch_setup(context, *args, **kwargs):
     run_initial_pose_tf = LaunchConfiguration("run_initial_pose_tf")
     run_plan_executor = LaunchConfiguration("run_plan_executor")
     plan_executor_delay = LaunchConfiguration("plan_executor_delay")
+    rollout_control_topic = LaunchConfiguration("rollout_control_topic")
+    rollout_reset_done_topic = LaunchConfiguration("rollout_reset_done_topic")
+    execution_status_topic = LaunchConfiguration("execution_status_topic")
     execution_backend = LaunchConfiguration("execution_backend").perform(context).strip().lower()
     run_plan_executor_enabled = (
         LaunchConfiguration("run_plan_executor").perform(context).strip().lower() == "true"
     )
+    run_tf_bridge_enabled = LaunchConfiguration("run_tf_bridge").perform(context).strip().lower() == "true"
 
     executor_executable = "MapfPathTracker"
     if execution_backend == "nav2":
@@ -222,7 +226,16 @@ def _launch_setup(context, *args, **kwargs):
         name="initial_pose_tf_publisher",
         output="screen",
         condition=IfCondition(run_initial_pose_tf),
-        parameters=[generated_initial_pose_tf_params, {"use_sim_time": use_sim_time}],
+        parameters=[
+            generated_initial_pose_tf_params,
+            {
+                "use_sim_time": use_sim_time,
+                "rollout_control_topic": rollout_control_topic,
+                "rollout_reset_done_topic": rollout_reset_done_topic,
+                "odom_topic_suffix": record_odom_topic_suffix,
+                "publish_global_tf": not run_tf_bridge_enabled,
+            },
+        ],
     )
 
     velocity_recorder = Node(
@@ -239,6 +252,7 @@ def _launch_setup(context, *args, **kwargs):
                 "odom_topic_suffix": record_odom_topic_suffix,
                 "record_frequency_hz": record_frequency_hz,
                 "experiments_dir": experiments_dir,
+                "rollout_control_topic": rollout_control_topic,
             }
         ],
     )
@@ -289,7 +303,16 @@ def _launch_setup(context, *args, **kwargs):
                 name="plan_executor",
                 output="screen",
                 condition=IfCondition(run_plan_executor),
-                parameters=[generated_mapf_params, {"use_sim_time": use_sim_time}],
+                parameters=[
+                    generated_mapf_params,
+                    {
+                        "use_sim_time": use_sim_time,
+                        "execution_status_topic": execution_status_topic,
+                        "rollout_control_topic": rollout_control_topic,
+                        "team_config_file": team_config_path,
+                        "experiments_dir": experiments_dir,
+                    },
+                ],
             )
         ],
     )
@@ -323,7 +346,7 @@ def generate_launch_description():
             carters_nav2_dir,
             "config",
             "warehouse",
-            "warehouse_team_config.yaml",
+            "warehouse_forklift.yaml",
         ),
         description="Full path to the shared robot team configuration YAML.",
     )
@@ -432,6 +455,27 @@ def generate_launch_description():
         default_value="1.5",
         description="Seconds to wait before starting the selected MAPF executor.",
     )
+    rollout_control_topic_arg = DeclareLaunchArgument(
+        "rollout_control_topic",
+        default_value="",
+        description=(
+            "Optional rollout-control PoseArray topic used for multi-rollout execution. "
+            "Leave empty for the legacy single-rollout flow."
+        ),
+    )
+    execution_status_topic_arg = DeclareLaunchArgument(
+        "execution_status_topic",
+        default_value="/mapf_base/plan_execution_status",
+        description="Status topic published by the active MAPF executor.",
+    )
+    rollout_reset_done_topic_arg = DeclareLaunchArgument(
+        "rollout_reset_done_topic",
+        default_value="",
+        description=(
+            "Optional Int32 acknowledgement topic published after Isaac Sim finishes a rollout reset. "
+            "When provided, the initial-pose TF publisher waits for this ack before switching poses."
+        ),
+    )
 
     return LaunchDescription(
         [
@@ -456,6 +500,9 @@ def generate_launch_description():
             run_plan_executor_arg,
             execution_backend_arg,
             plan_executor_delay_arg,
+            rollout_control_topic_arg,
+            rollout_reset_done_topic_arg,
+            execution_status_topic_arg,
             OpaqueFunction(function=_launch_setup),
         ]
     )

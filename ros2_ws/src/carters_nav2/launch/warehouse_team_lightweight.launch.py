@@ -510,7 +510,7 @@ def generate_launch_description():
                     carters_nav2_dir,
                     "config",
                     "warehouse",
-                    "warehouse_team_config.yaml",
+                    "warehouse_forklift.yaml",
                 ),
                 description="Full path to the shared robot team configuration YAML.",
             ),

@@ -15,7 +15,8 @@ mapf_base:
       planner_time_tolerance: 120.0
       goal_tolerance: 0.5
       continuous_planning: false
-      min_agent_center_distance_m: 1.1
+      # Includes a buffer for Carter footprint plus observed timed-tracker error.
+      min_agent_center_distance_m: 1.4
       static_obstacle_cost_threshold: 1
 
       ecbs:
@@ -54,7 +55,7 @@ mapf_base:
       slow_down_radius: 0.5
       linear_kp: 1.0
       angular_kp: 2.0
-      max_linear_speed: 0.5
+      max_linear_speed: 0.8
       max_angular_speed: 1.0
       mapf_step_duration: 0.5
       tracking_longitudinal_kp: 1.8

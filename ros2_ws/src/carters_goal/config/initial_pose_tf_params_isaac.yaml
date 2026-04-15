@@ -9,3 +9,5 @@ initial_pose_tf_publisher:
     # Flattened [x, y, z, qx, qy, qz, qw] array, rewritten at launch time
     # from warehouse_team_config.yaml.
     initial_poses: []
+    odom_topic_suffix: chassis/odom
+    reset_alignment_timeout_sec: 0.5

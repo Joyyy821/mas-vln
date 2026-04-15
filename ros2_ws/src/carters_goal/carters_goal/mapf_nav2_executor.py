@@ -16,6 +16,7 @@ from nav_msgs.msg import Path
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.time import Time
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -34,6 +35,10 @@ class MapfNav2Executor(Node):
         self.declare_parameter("controller_id", "")
         self.declare_parameter("goal_checker_id", "")
         self.declare_parameter("progress_checker_id", "")
+        self.declare_parameter("execution_status_topic", "/mapf_base/plan_execution_status")
+        self.declare_parameter("rollout_control_topic", "")
+        self.declare_parameter("team_config_file", "")
+        self.declare_parameter("experiments_dir", "")
 
         self._agent_num = int(self.get_parameter("agent_num").value)
         self._global_frame_id = str(self.get_parameter("global_frame_id").value)
@@ -48,6 +53,7 @@ class MapfNav2Executor(Node):
         self._controller_id = str(self.get_parameter("controller_id").value)
         self._goal_checker_id = str(self.get_parameter("goal_checker_id").value)
         self._progress_checker_id = str(self.get_parameter("progress_checker_id").value)
+        self._execution_status_topic = str(self.get_parameter("execution_status_topic").value)
 
         self._agent_names: List[str] = []
         self._base_frame_ids: List[str] = []
@@ -95,6 +101,9 @@ class MapfNav2Executor(Node):
             self._global_plan_topic,
             self._plan_callback,
             1,
+        )
+        self._execution_status_pub = self.create_publisher(
+            String, self._execution_status_topic, 10
         )
         self._startup_timer = self.create_timer(0.5, self._start_pending_plan)
         self._execution_timer = self.create_timer(
@@ -150,6 +159,7 @@ class MapfNav2Executor(Node):
         self._pre_rotate_yaws = [None] * self._agent_num
         self._final_goal_yaws = [None] * self._agent_num
 
+        self._publish_execution_status("active")
         self.get_logger().info(
             f"Starting FollowPath execution of MAPF plan with makespan "
             f"{self._current_plan.makespan}."
@@ -372,6 +382,7 @@ class MapfNav2Executor(Node):
             self._active = False
             self._current_plan = None
             self._publish_zero_to_all()
+            self._publish_execution_status("succeeded")
             self._start_pending_plan()
 
     def _abort_execution(self) -> None:
@@ -382,6 +393,7 @@ class MapfNav2Executor(Node):
         self._pre_rotate_yaws = [None] * self._agent_num
         self._final_goal_yaws = [None] * self._agent_num
         self._publish_zero_to_all()
+        self._publish_execution_status("failed")
 
     def _build_controller_path(self, raw_path: Path) -> Path:
         path = Path()
@@ -457,6 +469,11 @@ class MapfNav2Executor(Node):
     def _publish_zero_to_all(self) -> None:
         for agent_idx in range(self._agent_num):
             self._publish_zero(agent_idx)
+
+    def _publish_execution_status(self, status: str) -> None:
+        msg = String()
+        msg.data = status
+        self._execution_status_pub.publish(msg)
 
     def _yaw_to_quaternion(self, yaw: float) -> Quaternion:
         quat = Quaternion()

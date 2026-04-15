@@ -11,42 +11,17 @@ from typing import Any
 
 import rclpy
 import yaml
+from geometry_msgs.msg import PoseArray
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
-
-def _load_yaml_file(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as stream:
-        return yaml.safe_load(stream)
-
-
-def _extract_robot_namespaces(config: Any) -> list[str]:
-    robots = config.get("robots", []) if isinstance(config, dict) else []
-    namespaces: list[str] = []
-    for index, robot in enumerate(robots):
-        if not isinstance(robot, dict):
-            continue
-        namespaces.append(str(robot.get("name", f"robot{index + 1}")))
-    return namespaces
-
-
-def _find_repo_root(search_paths: list[Path]) -> Path:
-    for root in search_paths:
-        resolved = root.resolve()
-        candidates = [resolved] + list(resolved.parents)
-        for candidate in candidates:
-            if (candidate / ".gitignore").exists() and (candidate / "ros2_ws").exists():
-                return candidate
-    return Path.cwd().resolve()
-
-
-def _resolve_experiments_root(experiments_dir: str, team_config_path: Path) -> Path:
-    if experiments_dir:
-        return Path(experiments_dir).expanduser().resolve()
-
-    repo_root = _find_repo_root([Path.cwd(), team_config_path, Path(__file__)])
-    return repo_root / "experiments"
+from carters_goal.rollout_control import parse_rollout_id
+from carters_goal.shared_team_config import (
+    resolve_experiments_root,
+    rollout_run_dir,
+    team_config_utils,
+)
 
 
 def _next_run_id(run_config_dir: Path) -> int:
@@ -78,18 +53,43 @@ def _stamp_to_nanoseconds(msg: Odometry) -> int:
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 
+def _pose_array_to_legacy_pose_dict(pose_array: list[float]) -> dict[str, float]:
+    pose_dict = team_config_utils.pose_array_to_pose_dict(pose_array)
+    return {
+        "x": float(pose_dict["x"]),
+        "y": float(pose_dict["y"]),
+        "z": float(pose_dict["z"]),
+        "yaw": float(pose_dict["yaw"]),
+    }
+
+
+def _rollout_to_legacy_team_config(
+    team_config: dict[str, Any],
+    rollout: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "environment": dict(team_config.get("environment", {})),
+        "robots": [
+            {
+                "name": str(robot["name"]),
+                "initial_pose": _pose_array_to_legacy_pose_dict(robot["initial_pose"]),
+                "goal_pose": _pose_array_to_legacy_pose_dict(robot["goal_pose"]),
+            }
+            for robot in rollout.get("robots", [])
+        ],
+    }
+
+
 class RobotVelocityRecorder(Node):
     def __init__(self) -> None:
         super().__init__("robot_velocity_recorder")
 
         self.declare_parameter("team_config_file", "")
-        # An empty Python list is inferred as BYTE_ARRAY by rclpy, which breaks
-        # launch-time string-array overrides. Use a placeholder string entry and
-        # drop blank values after reading the parameter.
         self.declare_parameter("robot_namespaces", [""])
         self.declare_parameter("odom_topic_suffix", "chassis/odom")
         self.declare_parameter("record_frequency_hz", 20.0)
         self.declare_parameter("experiments_dir", "")
+        self.declare_parameter("rollout_control_topic", "")
 
         team_config_value = str(self.get_parameter("team_config_file").value).strip()
         if not team_config_value:
@@ -99,11 +99,14 @@ class RobotVelocityRecorder(Node):
         if not self._team_config_path.exists():
             raise FileNotFoundError(f"Team config file not found: {self._team_config_path}")
 
-        self._team_config = _load_yaml_file(self._team_config_path) or {}
+        self._team_config = team_config_utils.load_multi_rollout_config(str(self._team_config_path))
+        self._rollout_by_id = {
+            int(rollout["id"]): rollout for rollout in self._team_config["rollouts"]
+        }
         requested_namespaces = list(self.get_parameter("robot_namespaces").value)
         self._robot_namespaces = [str(name) for name in requested_namespaces if str(name).strip()]
         if not self._robot_namespaces:
-            self._robot_namespaces = _extract_robot_namespaces(self._team_config)
+            self._robot_namespaces = list(self._team_config["robot_namespaces"])
         if not self._robot_namespaces:
             raise ValueError(
                 "RobotVelocityRecorder could not determine any robot namespaces from parameters "
@@ -117,18 +120,18 @@ class RobotVelocityRecorder(Node):
             if self._record_frequency_hz > 0.0
             else 0
         )
-        experiments_dir = str(self.get_parameter("experiments_dir").value).strip()
-        self._experiments_root = _resolve_experiments_root(experiments_dir, self._team_config_path)
+        self._experiments_dir = str(self.get_parameter("experiments_dir").value).strip()
+        self._experiments_root = resolve_experiments_root(
+            self._experiments_dir, self._team_config_path
+        )
+        self._rollout_control_topic = str(self.get_parameter("rollout_control_topic").value).strip()
 
-        run_config_folder = self._team_config_path.stem.strip()
-        run_config_dir = self._experiments_root / run_config_folder
-        run_id = _next_run_id(run_config_dir)
-        self._run_dir = run_config_dir / str(run_id)
-        self._run_dir.mkdir(parents=True, exist_ok=False)
-
-        self._run_id = run_id
-        self._metadata_path = self._run_dir / "run_config.yaml"
-        self._created_at = dt.datetime.now().astimezone().isoformat()
+        self._active_rollout_id: int | None = None
+        self._active_rollout: dict[str, Any] | None = None
+        self._run_id: int | None = None
+        self._run_dir: Path | None = None
+        self._metadata_path: Path | None = None
+        self._created_at = ""
 
         self._sample_counts = {name: 0 for name in self._robot_namespaces}
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
@@ -138,15 +141,6 @@ class RobotVelocityRecorder(Node):
         self._odom_subscriptions = []
 
         for namespace in self._robot_namespaces:
-            file_path = self._run_dir / f"{namespace}_velocity.csv"
-            file_handle = file_path.open("w", encoding="utf-8", newline="")
-            writer = csv.writer(file_handle)
-            writer.writerow(["timestamp_ns", "vx", "vy", "wz"])
-            file_handle.flush()
-            self._file_handles[namespace] = file_handle
-            self._csv_writers[namespace] = writer
-            self._file_paths[namespace] = file_path
-
             topic_name = _join_topic(namespace, self._odom_topic_suffix)
             self._odom_subscriptions.append(
                 self.create_subscription(
@@ -157,13 +151,116 @@ class RobotVelocityRecorder(Node):
                 )
             )
 
+        self._control_sub = None
+        if self._rollout_control_topic:
+            self._control_sub = self.create_subscription(
+                PoseArray,
+                self._rollout_control_topic,
+                self._rollout_control_callback,
+                10,
+            )
+            self.get_logger().info(
+                f"Waiting for rollout-control messages on {self._rollout_control_topic}."
+            )
+        else:
+            default_rollout_id = int(self._team_config["first_rollout"]["id"])
+            self._activate_rollout(default_rollout_id, use_legacy_directory=True)
+
+    def _rollout_control_callback(self, msg: PoseArray) -> None:
+        rollout_id = parse_rollout_id(msg.header.frame_id)
+        if rollout_id is None:
+            return
+
+        if rollout_id <= 0:
+            self._close_active_rollout()
+            return
+
+        self._activate_rollout(rollout_id, use_legacy_directory=False)
+
+    def _activate_rollout(self, rollout_id: int, *, use_legacy_directory: bool) -> None:
+        if self._active_rollout_id == rollout_id and self._run_dir is not None:
+            return
+
+        rollout = self._rollout_by_id.get(rollout_id)
+        if rollout is None:
+            self.get_logger().error(
+                f"Ignoring rollout {rollout_id} because it is not defined in {self._team_config_path}."
+            )
+            return
+
+        self._close_active_rollout()
+
+        if use_legacy_directory:
+            run_config_dir = self._experiments_root / self._team_config_path.stem.strip()
+            run_id = _next_run_id(run_config_dir)
+            run_dir = run_config_dir / str(run_id)
+        else:
+            run_id = rollout_id
+            run_dir = rollout_run_dir(
+                self._experiments_dir,
+                team_config_path=self._team_config_path,
+                rollout_id=rollout_id,
+            )
+            if run_dir.exists():
+                raise RuntimeError(
+                    f"Refusing to overwrite existing rollout directory {run_dir}. "
+                    "Use skip_existed_rollout on the rollout manager to skip it."
+                )
+
+        run_dir.mkdir(parents=True, exist_ok=False)
+
+        self._active_rollout_id = rollout_id
+        self._active_rollout = rollout
+        self._run_id = run_id
+        self._run_dir = run_dir
+        self._metadata_path = run_dir / "run_config.yaml"
+        self._created_at = dt.datetime.now().astimezone().isoformat()
+        self._sample_counts = {name: 0 for name in self._robot_namespaces}
+        self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
+        self._file_handles = {}
+        self._csv_writers = {}
+        self._file_paths = {}
+
+        for namespace in self._robot_namespaces:
+            file_path = run_dir / f"{namespace}_velocity.csv"
+            file_handle = file_path.open("w", encoding="utf-8", newline="")
+            writer = csv.writer(file_handle)
+            writer.writerow(["timestamp_ns", "vx", "vy", "wz"])
+            file_handle.flush()
+            self._file_handles[namespace] = file_handle
+            self._csv_writers[namespace] = writer
+            self._file_paths[namespace] = file_path
+
         self._write_metadata()
         self.get_logger().info(
-            "Recording simulator odometry velocities for "
-            f"{len(self._robot_namespaces)} robots into {self._run_dir}."
+            "Recording simulator odometry velocities for rollout "
+            f"{rollout_id} into {run_dir}."
         )
 
+    def _close_active_rollout(self) -> None:
+        if self._run_dir is None:
+            self._active_rollout_id = None
+            self._active_rollout = None
+            return
+
+        self._write_metadata()
+        for file_handle in self._file_handles.values():
+            file_handle.close()
+
+        self._active_rollout_id = None
+        self._active_rollout = None
+        self._run_id = None
+        self._run_dir = None
+        self._metadata_path = None
+        self._created_at = ""
+        self._file_handles = {}
+        self._csv_writers = {}
+        self._file_paths = {}
+
     def _odom_callback(self, robot_name: str, msg: Odometry) -> None:
+        if self._active_rollout_id is None:
+            return
+
         stamp_ns = _stamp_to_nanoseconds(msg)
         if stamp_ns <= 0:
             stamp_ns = self.get_clock().now().nanoseconds
@@ -192,13 +289,23 @@ class RobotVelocityRecorder(Node):
         self._sample_counts[robot_name] += 1
 
     def _write_metadata(self) -> None:
+        if self._run_dir is None or self._metadata_path is None:
+            return
+        if self._active_rollout is None:
+            return
+
+        team_config_snapshot = _rollout_to_legacy_team_config(
+            self._team_config,
+            self._active_rollout,
+        )
+
         metadata = {
             "run_id": self._run_id,
             "created_at": self._created_at,
             "run_directory": str(self._run_dir),
             "run_config_name": self._team_config_path.name,
             "run_config_path": str(self._team_config_path),
-            "language_instruction": "",
+            "language_instruction": str(self._team_config.get("language_instruction", "") or ""),
             "record_settings": {
                 "source": "simulator_odometry",
                 "odom_topic_suffix": self._odom_topic_suffix,
@@ -212,7 +319,7 @@ class RobotVelocityRecorder(Node):
                 "timestamp_units": "nanoseconds",
                 "message_type": "nav_msgs/msg/Odometry",
             },
-            "team_config": self._team_config,
+            "team_config": team_config_snapshot,
             "artifacts": {
                 namespace: self._file_paths[namespace].name for namespace in self._robot_namespaces
             },
@@ -230,9 +337,7 @@ class RobotVelocityRecorder(Node):
             yaml.safe_dump(metadata, stream, sort_keys=False)
 
     def destroy_node(self) -> bool:
-        self._write_metadata()
-        for file_handle in self._file_handles.values():
-            file_handle.close()
+        self._close_active_rollout()
         return super().destroy_node()
 
 
