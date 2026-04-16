@@ -45,6 +45,7 @@ STANDALONE = True
 # "relative" path for env and nova carter usd (to get assets root dynamically)
 ENV_USD_REL = "/Isaac/Environments/Simple_Warehouse/warehouse_with_forklifts.usd"
 NOVA_CARTER_ROS_USD_REL = "/Isaac/Samples/ROS2/Robots/Nova_Carter_ROS.usd"
+NOVA_CARTER_RENDER_USD_REL = "/Isaac/Samples/AnimRobot/nova_carter.usd"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
@@ -145,7 +146,7 @@ def _parse_args():
 ###### Sim, stage, references utils ######
 ##########################################
 
-def _maybe_start_sim_app():
+def _maybe_start_sim_app(enable_ros2_bridge: bool = True):
     if not STANDALONE:
         return None
     
@@ -156,25 +157,32 @@ def _maybe_start_sim_app():
     # sim_app = SimulationApp({"headless": False})
     sim_app = SimulationApp({"headless": True})
 
-    # 2. Import the extension utility
-    from omni.isaac.core.utils.extensions import enable_extension
+    if enable_ros2_bridge:
+        # 2. Import the extension utility
+        from omni.isaac.core.utils.extensions import enable_extension
 
-    # 3. Enable the ROS 2 bridge extension
-    # Note: In Isaac Sim 5.1, the extension is named "isaacsim.ros2.bridge". 
-    # (If you are adapting older 4.x code, it used to be "omni.isaac.ros2_bridge")
-    enable_extension("isaacsim.ros2.bridge")
+        # 3. Enable the ROS 2 bridge extension
+        # Note: In Isaac Sim 5.1, the extension is named "isaacsim.ros2.bridge". 
+        # (If you are adapting older 4.x code, it used to be "omni.isaac.ros2_bridge")
+        enable_extension("isaacsim.ros2.bridge")
 
-    # 4. Force a simulation update to ensure the extension fully loads into memory
-    sim_app.update()
+        # 4. Force a simulation update to ensure the extension fully loads into memory
+        sim_app.update()
 
-    print("ROS 2 Bridge Enabled Successfully!")
+        print("ROS 2 Bridge Enabled Successfully!")
 
     return sim_app
 
 
 def _new_stage():
-    import omni.usd
-    omni.usd.get_context().new_stage()
+    try:
+        from isaacsim.core.utils.stage import create_new_stage
+    except Exception:
+        import omni.usd
+
+        omni.usd.get_context().new_stage()
+    else:
+        create_new_stage()
 
 
 def _set_stage_units(meters_per_unit: float = 1.0):
@@ -185,12 +193,20 @@ def _set_stage_units(meters_per_unit: float = 1.0):
 
 
 def _add_reference(usd_path: str, prim_path: str):
-    from omni.isaac.core.utils.stage import add_reference_to_stage
+    try:
+        from isaacsim.core.utils.stage import add_reference_to_stage
+    except Exception:
+        from omni.isaac.core.utils.stage import add_reference_to_stage
+
     add_reference_to_stage(usd_path=usd_path, prim_path=prim_path)
 
 
 def _define_xform(path: str):
-    from omni.isaac.core.utils.prims import define_prim
+    try:
+        from isaacsim.core.utils.prims import define_prim
+    except Exception:
+        from omni.isaac.core.utils.prims import define_prim
+
     define_prim(path, "Xform")
 
 
@@ -735,7 +751,12 @@ class IsaacRolloutResetBridge:
 ##########################################
 
 
-def build_stage(team_config_file: str, output_usd: str):
+def build_stage(
+    team_config_file: str,
+    output_usd: str,
+    enable_ros2: bool = True,
+    robot_usd_rel: str | None = None,
+):
     from isaacsim.storage.native import get_assets_root_path
     assets_root_path = get_assets_root_path()
     team_config = team_config_utils.load_team_config(team_config_file, maps_dir=MAPS_DIR)
@@ -753,7 +774,10 @@ def build_stage(team_config_file: str, output_usd: str):
     _add_reference(f"{assets_root_path}{ENV_USD_REL}", env_prim)
 
     # 2) Robots from the shared team config.
-    carter_usd = f"{assets_root_path}{NOVA_CARTER_ROS_USD_REL}"
+    carter_usd_rel = robot_usd_rel or (
+        NOVA_CARTER_ROS_USD_REL if enable_ros2 else NOVA_CARTER_RENDER_USD_REL
+    )
+    carter_usd = f"{assets_root_path}{carter_usd_rel}"
     robot_prim_paths: list[str] = []
     for index, robot in enumerate(team_config["robots"], start=1):
         robot_prim = f"/World/Robots/NovaCarter_{index}"
@@ -772,11 +796,13 @@ def build_stage(team_config_file: str, output_usd: str):
             yaw_deg=initial_pose["yaw"] * 180.0 / 3.141592653589793,
         )
 
-        # Match Isaac Sim's multi-robot Nav2 example: namespace ROS topics per robot,
-        # but keep TF frame ids as the asset defaults (map / odom / base_link / sensor frames).
-        _fix_ros2_graph_under(robot_prim, robot["name"], prefix_frames=False)
+        if enable_ros2:
+            # Match Isaac Sim's multi-robot Nav2 example: namespace ROS topics per robot,
+            # but keep TF frame ids as the asset defaults (map / odom / base_link / sensor frames).
+            _fix_ros2_graph_under(robot_prim, robot["name"], prefix_frames=False)
 
-    _ensure_global_ros2_clock_graph("/clock")
+    if enable_ros2:
+        _ensure_global_ros2_clock_graph("/clock")
 
     # 4) Save (optional)
     if output_usd:
@@ -786,7 +812,7 @@ def build_stage(team_config_file: str, output_usd: str):
 
     print(
         "[OK] Stage built: warehouse + "
-        f"{team_config['agent_num']} Nova_Carter_ROS robots from {team_config_file}"
+        f"{team_config['agent_num']} robots from {team_config_file} using {carter_usd_rel}"
     )
 
     # debug camera topic collisions
