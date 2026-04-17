@@ -7,6 +7,7 @@ import csv
 import gc
 import importlib.util
 import math
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,10 +26,9 @@ try:
         temporary_team_config_file,
     )
     from .trajectory_integration import (
-        IntegratedTrajectory,
         TimedPose,
+        build_pose_trajectory,
         integrate_velocity_samples,
-        sample_trajectories_on_timestamps,
     )
 except ImportError:
     from rollout_io import (
@@ -40,10 +40,9 @@ except ImportError:
         temporary_team_config_file,
     )
     from trajectory_integration import (
-        IntegratedTrajectory,
         TimedPose,
+        build_pose_trajectory,
         integrate_velocity_samples,
-        sample_trajectories_on_timestamps,
     )
 
 
@@ -177,7 +176,10 @@ def _yaw_to_quaternion(yaw_rad: float) -> tuple[float, float, float, float]:
     return (0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw))
 
 
-def _compute_root_pose_from_base_pose(base_pose: TimedPose, robot_spec: Any) -> tuple[tuple[float, float, float], float]:
+def _compute_root_pose_from_base_pose(
+    base_pose: TimedPose,
+    robot_spec: Any,
+) -> tuple[tuple[float, float, float], float]:
     base_world = _translation_matrix((base_pose.x, base_pose.y, base_pose.z)) @ _rotation_matrix_z(
         base_pose.yaw
     )
@@ -239,31 +241,134 @@ def _prepare_robot_output_dirs(
     return output_dirs
 
 
-def _prepare_rollout_trajectories(
+def _has_global_recorded_pose(rollout: RolloutData, robot: RolloutRobotData) -> bool:
+    if not robot.has_recorded_pose:
+        return False
+    return str(rollout.record_settings.get("source", "")).strip() == "simulator_tf_and_odometry"
+
+
+def _build_render_timestamps_ns(rollout: RolloutData) -> tuple[int, ...]:
+    unique_timestamps_ns = sorted(set(rollout.replay_timestamps_ns))
+    if len(unique_timestamps_ns) < 2:
+        return tuple(unique_timestamps_ns)
+
+    per_robot_periods_ns: list[int] = []
+    for robot in rollout.robots:
+        timestamps_ns = [sample.timestamp_ns for sample in robot.velocity_samples]
+        deltas_ns = [
+            next_timestamp_ns - timestamp_ns
+            for timestamp_ns, next_timestamp_ns in zip(timestamps_ns, timestamps_ns[1:])
+            if next_timestamp_ns > timestamp_ns
+        ]
+        if deltas_ns:
+            per_robot_periods_ns.append(int(statistics.median(deltas_ns)))
+
+    if not per_robot_periods_ns:
+        return tuple(unique_timestamps_ns)
+
+    nominal_period_ns = int(statistics.median(per_robot_periods_ns))
+    cluster_gap_ns = max(int(round(nominal_period_ns * 0.4)), 1)
+    clustered_timestamps_ns: list[int] = []
+    current_cluster = [unique_timestamps_ns[0]]
+    for timestamp_ns in unique_timestamps_ns[1:]:
+        if timestamp_ns - current_cluster[-1] <= cluster_gap_ns:
+            current_cluster.append(timestamp_ns)
+            continue
+        clustered_timestamps_ns.append(int(round(statistics.median(current_cluster))))
+        current_cluster = [timestamp_ns]
+    clustered_timestamps_ns.append(int(round(statistics.median(current_cluster))))
+
+    if len(clustered_timestamps_ns) != len(unique_timestamps_ns):
+        print(
+            f"[INFO] Rollout {rollout.rollout_id}: collapsed {len(unique_timestamps_ns)} raw "
+            f"timestamps into {len(clustered_timestamps_ns)} render frames using a "
+            f"{cluster_gap_ns * 1e-6:.1f} ms clustering window.",
+            flush=True,
+        )
+    return tuple(clustered_timestamps_ns)
+
+
+def _prepare_rollout_sampled_poses(
     rollout: RolloutData,
-) -> tuple[dict[str, IntegratedTrajectory], dict[str, list[TimedPose]]]:
-    trajectories = {
-        robot.name: integrate_velocity_samples(
+    render_timestamps_ns: tuple[int, ...],
+) -> tuple[dict[str, list[TimedPose]], dict[str, str]]:
+    sampled_poses_by_robot: dict[str, list[TimedPose]] = {}
+    pose_source_by_robot: dict[str, str] = {}
+    for robot in rollout.robots:
+        if _has_global_recorded_pose(rollout, robot):
+            pose_trajectory = build_pose_trajectory(
+                [
+                    TimedPose(
+                        timestamp_ns=sample.timestamp_ns,
+                        x=float(sample.x),
+                        y=float(sample.y),
+                        z=robot.initial_pose.z,
+                        yaw=float(sample.yaw),
+                    )
+                    for sample in robot.velocity_samples
+                ],
+                source_label=str(robot.velocity_path),
+            )
+            sampled_poses_by_robot[robot.name] = pose_trajectory.sample(render_timestamps_ns)
+            pose_source_by_robot[robot.name] = "recorded_global_pose"
+            print(
+                f"[INFO] Rollout {rollout.rollout_id} robot {robot.name}: "
+                "replaying directly from recorded global poses.",
+                flush=True,
+            )
+            continue
+
+        if robot.has_recorded_pose:
+            print(
+                f"[WARN] Rollout {rollout.rollout_id} robot {robot.name}: "
+                "pose columns were not recorded from a trusted global TF source; "
+                "falling back to dead-reckoned velocity integration.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[WARN] Rollout {rollout.rollout_id} robot {robot.name}: "
+                "pose columns were not recorded; falling back to dead-reckoned velocity integration.",
+                flush=True,
+            )
+
+        integrated_trajectory = integrate_velocity_samples(
             robot.initial_pose,
             robot.velocity_samples,
             source_label=str(robot.velocity_path),
         )
-        for robot in rollout.robots
-    }
-    sampled_poses = sample_trajectories_on_timestamps(trajectories, rollout.replay_timestamps_ns)
-    return trajectories, sampled_poses
+        sampled_poses_by_robot[robot.name] = integrated_trajectory.sample(render_timestamps_ns)
+        pose_source_by_robot[robot.name] = "velocity_integration_fallback"
+
+    return sampled_poses_by_robot, pose_source_by_robot
 
 
-def _write_integrated_pose_csvs(
+def _write_replay_pose_csvs(
     rollout: RolloutData,
+    render_timestamps_ns: tuple[int, ...],
     sampled_poses_by_robot: dict[str, list[TimedPose]],
+    pose_source_by_robot: dict[str, str],
 ) -> None:
-    elapsed_seconds = replay_elapsed_seconds(rollout.replay_timestamps_ns)
+    elapsed_seconds = replay_elapsed_seconds(render_timestamps_ns)
     for robot in rollout.robots:
-        output_path = rollout.rollout_dir / f"integrated_pose_{robot.name}.csv"
+        output_path = rollout.rollout_dir / f"replay_pose_{robot.name}.csv"
         with output_path.open("w", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream)
-            writer.writerow(["timestamp_ns", "elapsed_s", "x", "y", "z", "yaw", "qx", "qy", "qz", "qw"])
+            writer.writerow(
+                [
+                    "timestamp_ns",
+                    "elapsed_s",
+                    "x",
+                    "y",
+                    "z",
+                    "yaw",
+                    "qx",
+                    "qy",
+                    "qz",
+                    "qw",
+                    "pose_source",
+                ]
+            )
             for timed_pose, elapsed_s in zip(sampled_poses_by_robot[robot.name], elapsed_seconds):
                 qx, qy, qz, qw = _yaw_to_quaternion(timed_pose.yaw)
                 writer.writerow(
@@ -278,6 +383,7 @@ def _write_integrated_pose_csvs(
                         f"{qy:.9f}",
                         f"{qz:.9f}",
                         f"{qw:.9f}",
+                        pose_source_by_robot[robot.name],
                     ]
                 )
 
@@ -437,10 +543,18 @@ def _render_rollout(
 ) -> None:
     rgb_root, depth_root = _ensure_render_outputs_empty(rollout.rollout_dir)
     robot_output_dirs = _prepare_robot_output_dirs(rgb_root, depth_root, rollout.robots)
-    trajectories, sampled_poses_by_robot = _prepare_rollout_trajectories(rollout)
-    del trajectories
+    render_timestamps_ns = _build_render_timestamps_ns(rollout)
+    sampled_poses_by_robot, pose_source_by_robot = _prepare_rollout_sampled_poses(
+        rollout,
+        render_timestamps_ns,
+    )
 
-    _write_integrated_pose_csvs(rollout, sampled_poses_by_robot)
+    _write_replay_pose_csvs(
+        rollout,
+        render_timestamps_ns,
+        sampled_poses_by_robot,
+        pose_source_by_robot,
+    )
     with temporary_team_config_file(rollout) as team_config_path:
         build_attempts = [
             ("render asset", {"enable_ros2": False}),
@@ -513,13 +627,13 @@ def _render_rollout(
         _warm_up_cameras(sim_app, live_contexts)
 
         manifest_path = rollout.rollout_dir / "render_manifest.csv"
-        elapsed_seconds = replay_elapsed_seconds(rollout.replay_timestamps_ns)
+        elapsed_seconds = replay_elapsed_seconds(render_timestamps_ns)
         with manifest_path.open("w", encoding="utf-8", newline="") as manifest_stream:
             manifest_writer = csv.writer(manifest_stream)
             manifest_writer.writerow(["frame_index", "timestamp_ns", "elapsed_s"])
-            total_frames = len(rollout.replay_timestamps_ns)
+            total_frames = len(render_timestamps_ns)
             for frame_index, (timestamp_ns, elapsed_s) in enumerate(
-                zip(rollout.replay_timestamps_ns, elapsed_seconds)
+                zip(render_timestamps_ns, elapsed_seconds)
             ):
                 for context in live_contexts:
                     base_pose = sampled_poses_by_robot[context.robot_name][frame_index]
@@ -553,16 +667,21 @@ def _render_rollout(
                         flush=True,
                     )
     finally:
+        try:
+            timeline.stop()
+        except Exception as exc:
+            print(
+                f"[WARN] Failed to stop Isaac timeline cleanly after rollout "
+                f"{rollout.rollout_id}: {exc}",
+                flush=True,
+            )
+        for _ in range(2):
+            sim_app.update()
         for context in live_contexts:
             _cleanup_camera(context)
         live_contexts.clear()
         gc.collect()
-        try:
-            timeline.stop()
-        except Exception as exc:
-            print(f"[WARN] Failed to stop Isaac timeline cleanly after rollout {rollout.rollout_id}: {exc}", flush=True)
-        for _ in range(2):
-            sim_app.update()
+        sim_app.update()
 
 
 def main() -> int:

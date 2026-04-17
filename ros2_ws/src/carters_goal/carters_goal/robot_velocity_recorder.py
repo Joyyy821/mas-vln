@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import math
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ from geometry_msgs.msg import PoseArray
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from carters_goal.rollout_control import parse_rollout_id
 from carters_goal.shared_team_config import (
@@ -48,9 +51,26 @@ def _join_topic(namespace: str, suffix: str) -> str:
     return f"/{namespace}/{clean_suffix}"
 
 
+def _join_frame(namespace: str, suffix: str) -> str:
+    clean_namespace = namespace.strip("/")
+    clean_suffix = suffix.strip("/")
+    if not clean_namespace:
+        return clean_suffix
+    if not clean_suffix:
+        return clean_namespace
+    return f"{clean_namespace}/{clean_suffix}"
+
+
 def _stamp_to_nanoseconds(msg: Odometry) -> int:
     stamp = msg.header.stamp
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def _yaw_from_quaternion(quat: Any) -> float:
+    return math.atan2(
+        2.0 * (quat.w * quat.z + quat.x * quat.y),
+        1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z),
+    )
 
 
 def _pose_array_to_legacy_pose_dict(pose_array: list[float]) -> dict[str, float]:
@@ -90,6 +110,8 @@ class RobotVelocityRecorder(Node):
         self.declare_parameter("record_frequency_hz", 20.0)
         self.declare_parameter("experiments_dir", "")
         self.declare_parameter("rollout_control_topic", "")
+        self.declare_parameter("global_frame_id", "map")
+        self.declare_parameter("base_frame_suffix", "base_link")
 
         team_config_value = str(self.get_parameter("team_config_file").value).strip()
         if not team_config_value:
@@ -125,6 +147,10 @@ class RobotVelocityRecorder(Node):
             self._experiments_dir, self._team_config_path
         )
         self._rollout_control_topic = str(self.get_parameter("rollout_control_topic").value).strip()
+        self._global_frame_id = str(self.get_parameter("global_frame_id").value).strip() or "map"
+        self._base_frame_suffix = (
+            str(self.get_parameter("base_frame_suffix").value).strip() or "base_link"
+        )
 
         self._active_rollout_id: int | None = None
         self._active_rollout: dict[str, Any] | None = None
@@ -135,10 +161,17 @@ class RobotVelocityRecorder(Node):
 
         self._sample_counts = {name: 0 for name in self._robot_namespaces}
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
+        self._last_tf_warn_ns = {name: 0 for name in self._robot_namespaces}
         self._file_handles: dict[str, Any] = {}
         self._csv_writers: dict[str, csv.writer] = {}
         self._file_paths: dict[str, Path] = {}
         self._odom_subscriptions = []
+        self._base_frame_ids = {
+            name: _join_frame(name, self._base_frame_suffix) for name in self._robot_namespaces
+        }
+
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
         for namespace in self._robot_namespaces:
             topic_name = _join_topic(namespace, self._odom_topic_suffix)
@@ -217,6 +250,7 @@ class RobotVelocityRecorder(Node):
         self._created_at = dt.datetime.now().astimezone().isoformat()
         self._sample_counts = {name: 0 for name in self._robot_namespaces}
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
+        self._last_tf_warn_ns = {name: 0 for name in self._robot_namespaces}
         self._file_handles = {}
         self._csv_writers = {}
         self._file_paths = {}
@@ -225,7 +259,7 @@ class RobotVelocityRecorder(Node):
             file_path = run_dir / f"{namespace}_velocity.csv"
             file_handle = file_path.open("w", encoding="utf-8", newline="")
             writer = csv.writer(file_handle)
-            writer.writerow(["timestamp_ns", "vx", "vy", "wz"])
+            writer.writerow(["timestamp_ns", "vx", "vy", "wz", "x", "y", "yaw"])
             file_handle.flush()
             self._file_handles[namespace] = file_handle
             self._csv_writers[namespace] = writer
@@ -233,7 +267,7 @@ class RobotVelocityRecorder(Node):
 
         self._write_metadata()
         self.get_logger().info(
-            "Recording simulator odometry velocities for rollout "
+            "Recording simulator odometry pose/velocity samples for rollout "
             f"{rollout_id} into {run_dir}."
         )
 
@@ -276,17 +310,46 @@ class RobotVelocityRecorder(Node):
         ):
             return
 
+        pose = self._lookup_robot_pose(robot_name)
+        if pose is None:
+            return
+
         self._csv_writers[robot_name].writerow(
             [
                 stamp_ns,
                 msg.twist.twist.linear.x,
                 msg.twist.twist.linear.y,
                 msg.twist.twist.angular.z,
+                pose[0],
+                pose[1],
+                pose[2],
             ]
         )
         self._file_handles[robot_name].flush()
         self._last_recorded_stamp_ns[robot_name] = stamp_ns
         self._sample_counts[robot_name] += 1
+
+    def _lookup_robot_pose(self, robot_name: str) -> tuple[float, float, float] | None:
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self._global_frame_id,
+                self._base_frame_ids[robot_name],
+                Time(),
+            )
+        except TransformException as exc:
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - self._last_tf_warn_ns[robot_name] > int(2e9):
+                self.get_logger().warn(
+                    f"Unable to lookup {self._global_frame_id} -> "
+                    f"{self._base_frame_ids[robot_name]} while recording {robot_name}: {exc}"
+                )
+                self._last_tf_warn_ns[robot_name] = now_ns
+            return None
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        yaw = _yaw_from_quaternion(rotation)
+        return translation.x, translation.y, yaw
 
     def _write_metadata(self) -> None:
         if self._run_dir is None or self._metadata_path is None:
@@ -307,7 +370,7 @@ class RobotVelocityRecorder(Node):
             "run_config_path": str(self._team_config_path),
             "language_instruction": str(self._team_config.get("language_instruction", "") or ""),
             "record_settings": {
-                "source": "simulator_odometry",
+                "source": "simulator_tf_and_odometry",
                 "odom_topic_suffix": self._odom_topic_suffix,
                 "record_frequency_hz": self._record_frequency_hz,
                 "timestamp_field": "header.stamp",
@@ -316,6 +379,13 @@ class RobotVelocityRecorder(Node):
                     "vy": "twist.twist.linear.y",
                     "wz": "twist.twist.angular.z",
                 },
+                "pose_fields": {
+                    "x": f"tf[{self._global_frame_id} -> <robot>/{self._base_frame_suffix}].translation.x",
+                    "y": f"tf[{self._global_frame_id} -> <robot>/{self._base_frame_suffix}].translation.y",
+                    "yaw": f"quaternion_to_yaw(tf[{self._global_frame_id} -> <robot>/{self._base_frame_suffix}].rotation)",
+                },
+                "global_frame_id": self._global_frame_id,
+                "base_frame_suffix": self._base_frame_suffix,
                 "timestamp_units": "nanoseconds",
                 "message_type": "nav_msgs/msg/Odometry",
             },
@@ -327,6 +397,7 @@ class RobotVelocityRecorder(Node):
                 {
                     "name": namespace,
                     "odom_topic": _join_topic(namespace, self._odom_topic_suffix),
+                    "base_frame_id": self._base_frame_ids[namespace],
                     "recording_file": self._file_paths[namespace].name,
                     "sample_count": self._sample_counts[namespace],
                 }

@@ -5,7 +5,11 @@ import unittest
 import warnings
 
 from isaac_sim.rendering.rollout_io import RobotPose, VelocitySample
-from isaac_sim.rendering.trajectory_integration import integrate_velocity_samples
+from isaac_sim.rendering.trajectory_integration import (
+    TimedPose,
+    build_pose_trajectory,
+    integrate_velocity_samples,
+)
 
 
 def _sample(timestamp_ns: int, vx: float, vy: float, wz: float) -> VelocitySample:
@@ -96,6 +100,45 @@ class TrajectoryIntegrationTest(unittest.TestCase):
         pose = trajectory.pose_at(3_000_000_000)
         self.assertAlmostEqual(pose.x, 3.0, places=6)
         self.assertAlmostEqual(pose.y, 0.0, places=6)
+
+    def test_pose_trajectory_interpolates_recorded_pose_samples(self) -> None:
+        trajectory = build_pose_trajectory(
+            [
+                TimedPose(timestamp_ns=0, x=0.0, y=0.0, z=0.0, yaw=0.0),
+                TimedPose(timestamp_ns=1_000_000_000, x=1.0, y=2.0, z=0.0, yaw=math.pi / 2.0),
+            ],
+            source_label="recorded_pose",
+        )
+
+        pose = trajectory.pose_at(500_000_000)
+        self.assertAlmostEqual(pose.x, 0.5, places=6)
+        self.assertAlmostEqual(pose.y, 1.0, places=6)
+        self.assertAlmostEqual(pose.yaw, math.pi / 4.0, places=6)
+
+    def test_pose_trajectory_interpolates_yaw_across_pi_with_shortest_turn(self) -> None:
+        trajectory = build_pose_trajectory(
+            [
+                TimedPose(
+                    timestamp_ns=0,
+                    x=0.0,
+                    y=0.0,
+                    z=0.0,
+                    yaw=math.radians(170.0),
+                ),
+                TimedPose(
+                    timestamp_ns=1_000_000_000,
+                    x=1.0,
+                    y=0.0,
+                    z=0.0,
+                    yaw=math.radians(-170.0),
+                ),
+            ],
+            source_label="wrapped_pose",
+        )
+
+        pose = trajectory.pose_at(500_000_000)
+        self.assertAlmostEqual(pose.x, 0.5, places=6)
+        self.assertAlmostEqual(abs(pose.yaw), math.pi, places=6)
 
 
 if __name__ == "__main__":

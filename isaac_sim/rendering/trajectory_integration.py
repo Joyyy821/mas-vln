@@ -81,6 +81,36 @@ class IntegratedTrajectory:
         return [self.pose_at(int(timestamp_ns)) for timestamp_ns in timestamps_ns]
 
 
+@dataclass(frozen=True)
+class PoseTrajectory:
+    source_label: str
+    keyframes: tuple[TimedPose, ...]
+
+    @property
+    def first_timestamp_ns(self) -> int:
+        return self.keyframes[0].timestamp_ns
+
+    @property
+    def last_timestamp_ns(self) -> int:
+        return self.keyframes[-1].timestamp_ns
+
+    def pose_at(self, timestamp_ns: int) -> TimedPose:
+        if timestamp_ns <= self.first_timestamp_ns:
+            return _copy_timed_pose_at(self.keyframes[0], timestamp_ns=int(timestamp_ns))
+        if timestamp_ns >= self.last_timestamp_ns:
+            return _copy_timed_pose_at(self.keyframes[-1], timestamp_ns=int(timestamp_ns))
+
+        keyframe_timestamps = [pose.timestamp_ns for pose in self.keyframes]
+        segment_index = bisect_right(keyframe_timestamps, int(timestamp_ns)) - 1
+        segment_index = max(0, min(segment_index, len(self.keyframes) - 2))
+        start_pose = self.keyframes[segment_index]
+        end_pose = self.keyframes[segment_index + 1]
+        return interpolate_timed_pose(start_pose, end_pose, timestamp_ns=int(timestamp_ns))
+
+    def sample(self, timestamps_ns: Sequence[int]) -> list[TimedPose]:
+        return [self.pose_at(int(timestamp_ns)) for timestamp_ns in timestamps_ns]
+
+
 def integrate_velocity_samples(
     initial_pose: RobotPose,
     velocity_samples: Sequence[VelocitySample],
@@ -161,8 +191,72 @@ def sanitize_velocity_samples(
     return samples
 
 
+def sanitize_timed_poses(
+    pose_samples: Sequence[TimedPose],
+    *,
+    source_label: str,
+) -> list[TimedPose]:
+    if not pose_samples:
+        raise ValueError(f"{source_label} contains no pose samples.")
+
+    raw_samples = list(pose_samples)
+    timestamps = [sample.timestamp_ns for sample in raw_samples]
+    if timestamps != sorted(timestamps):
+        warnings.warn(
+            f"{source_label} has non-monotonic pose timestamps; sorting samples before interpolation.",
+            stacklevel=2,
+        )
+
+    deduped_by_timestamp: dict[int, TimedPose] = {}
+    duplicate_count = 0
+    for sample in raw_samples:
+        if sample.timestamp_ns in deduped_by_timestamp:
+            duplicate_count += 1
+        deduped_by_timestamp[sample.timestamp_ns] = sample
+
+    if duplicate_count:
+        warnings.warn(
+            f"{source_label} has {duplicate_count} duplicate pose timestamps; keeping the last pose for each timestamp.",
+            stacklevel=2,
+        )
+
+    samples = [deduped_by_timestamp[timestamp_ns] for timestamp_ns in sorted(deduped_by_timestamp)]
+    if not samples:
+        raise ValueError(f"{source_label} has no usable pose samples after sanitization.")
+    return samples
+
+
+def build_pose_trajectory(
+    pose_samples: Sequence[TimedPose],
+    *,
+    source_label: str,
+) -> PoseTrajectory:
+    samples = sanitize_timed_poses(pose_samples, source_label=source_label)
+    keyframes = tuple(
+        TimedPose(
+            timestamp_ns=sample.timestamp_ns,
+            x=sample.x,
+            y=sample.y,
+            z=sample.z,
+            yaw=wrap_to_pi(sample.yaw),
+        )
+        for sample in samples
+    )
+    return PoseTrajectory(source_label=source_label, keyframes=keyframes)
+
+
 def sample_trajectories_on_timestamps(
     trajectories: dict[str, IntegratedTrajectory],
+    timestamps_ns: Sequence[int],
+) -> dict[str, list[TimedPose]]:
+    return {
+        robot_name: trajectory.sample(timestamps_ns)
+        for robot_name, trajectory in trajectories.items()
+    }
+
+
+def sample_pose_trajectories_on_timestamps(
+    trajectories: dict[str, PoseTrajectory],
     timestamps_ns: Sequence[int],
 ) -> dict[str, list[TimedPose]]:
     return {
@@ -204,6 +298,42 @@ def integrate_step(
         y=start_pose.y + world_dy,
         z=start_pose.z,
         yaw=wrap_to_pi(start_pose.yaw + theta),
+    )
+
+
+def interpolate_timed_pose(
+    start_pose: TimedPose,
+    end_pose: TimedPose,
+    *,
+    timestamp_ns: int,
+) -> TimedPose:
+    if timestamp_ns <= start_pose.timestamp_ns:
+        return _copy_timed_pose_at(start_pose, timestamp_ns=timestamp_ns)
+    if timestamp_ns >= end_pose.timestamp_ns:
+        return _copy_timed_pose_at(end_pose, timestamp_ns=timestamp_ns)
+
+    span_ns = end_pose.timestamp_ns - start_pose.timestamp_ns
+    if span_ns <= 0:
+        return _copy_timed_pose_at(end_pose, timestamp_ns=timestamp_ns)
+
+    ratio = (int(timestamp_ns) - start_pose.timestamp_ns) / span_ns
+    yaw_delta = wrap_to_pi(end_pose.yaw - start_pose.yaw)
+    return TimedPose(
+        timestamp_ns=int(timestamp_ns),
+        x=start_pose.x + ratio * (end_pose.x - start_pose.x),
+        y=start_pose.y + ratio * (end_pose.y - start_pose.y),
+        z=start_pose.z + ratio * (end_pose.z - start_pose.z),
+        yaw=wrap_to_pi(start_pose.yaw + ratio * yaw_delta),
+    )
+
+
+def _copy_timed_pose_at(pose: TimedPose, *, timestamp_ns: int) -> TimedPose:
+    return TimedPose(
+        timestamp_ns=int(timestamp_ns),
+        x=pose.x,
+        y=pose.y,
+        z=pose.z,
+        yaw=pose.yaw,
     )
 
 

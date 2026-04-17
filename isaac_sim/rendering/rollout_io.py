@@ -28,6 +28,13 @@ class VelocitySample:
     vx: float
     vy: float
     wz: float
+    x: float | None = None
+    y: float | None = None
+    yaw: float | None = None
+
+    @property
+    def has_pose(self) -> bool:
+        return self.x is not None and self.y is not None and self.yaw is not None
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,12 @@ class RolloutRobotData:
     tracker_path: Path | None
     tracker_samples: tuple[TrackerSample, ...]
 
+    @property
+    def has_recorded_pose(self) -> bool:
+        return bool(self.velocity_samples) and all(
+            sample.has_pose for sample in self.velocity_samples
+        )
+
 
 @dataclass(frozen=True)
 class RolloutData:
@@ -56,6 +69,7 @@ class RolloutData:
     run_config_path: Path
     created_at: str
     language_instruction: str
+    record_settings: dict[str, Any]
     team_config_snapshot: dict[str, Any]
     robots: tuple[RolloutRobotData, ...]
     replay_timestamps_ns: tuple[int, ...]
@@ -162,6 +176,7 @@ def load_rollout(rollout_dir: str | Path) -> RolloutData:
         run_config_path=run_config_path,
         created_at=str(run_config.get("created_at", "") or ""),
         language_instruction=str(run_config.get("language_instruction", "") or ""),
+        record_settings=dict(run_config.get("record_settings", {}) or {}),
         team_config_snapshot=team_config_snapshot,
         robots=tuple(robots),
         replay_timestamps_ns=tuple(sorted(replay_timestamps)),
@@ -255,12 +270,22 @@ def _load_velocity_samples(csv_path: Path) -> list[VelocitySample]:
             missing_label = ", ".join(sorted(missing))
             raise ValueError(f"{csv_path} is missing required columns: {missing_label}")
 
+        pose_columns = {"x", "y", "yaw"}
+        present_pose_columns = pose_columns.intersection(reader.fieldnames)
+        if present_pose_columns and present_pose_columns != pose_columns:
+            missing_pose_label = ", ".join(sorted(pose_columns.difference(reader.fieldnames)))
+            raise ValueError(f"{csv_path} is missing required pose columns: {missing_pose_label}")
+        has_pose_columns = present_pose_columns == pose_columns
+
         samples = [
             VelocitySample(
                 timestamp_ns=int(row["timestamp_ns"]),
                 vx=float(row["vx"]),
                 vy=float(row["vy"]),
                 wz=float(row["wz"]),
+                x=float(row["x"]) if has_pose_columns else None,
+                y=float(row["y"]) if has_pose_columns else None,
+                yaw=float(row["yaw"]) if has_pose_columns else None,
             )
             for row in reader
         ]

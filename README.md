@@ -63,3 +63,9 @@ ros2 launch carters_goal isaac_ros_mapf_rollouts.launch.py \
   execution_backend:=timed_tracker \
   skip_existed_rollout:=true
 ```
+
+## Rendering RGBD camera views
+From Isaac Sim installation on host machine:
+```bash
+./python.sh ~/IsaacSim-ros_workspaces/humble_ws/src/mas-vln/isaac_sim/rendering/render_rollout_rgbd.py --experiments-root ~/IsaacSim-ros_workspaces/humble_ws/src/mas-vln/experiments/warehouse_forklift
+```
