@@ -1,0 +1,43 @@
+variant_id: messy
+description: Starter template with heavier geometry clutter and wider pose variance while preserving feasibility.
+metadata:
+  layout_class: messy
+
+focus_distance_range_m: [2.25, 5.0]
+
+light_randomizer_overrides:
+  warehouse_lights:
+    intensity_range: [600.0, 1000.0]
+    color_value_range:
+      - [0.82, 1.0]
+      - [0.82, 1.0]
+      - [0.78, 1.0]
+    temperature_range: [3200.0, 5600.0]
+
+object_randomizer_overrides:
+  appearance_props_colors:
+    color_value_range:
+      - [0.30, 0.95]
+      - [0.30, 0.95]
+      - [0.30, 0.95]
+  forklift_layout:
+    keepout_zone_ids: [main_corridor]
+    xy_jitter_m: [1.15, 1.15]
+    yaw_jitter_deg: [-32.0, 32.0]
+    uniform_scale_range: [1.0, 1.0]
+    collision_margin_m: 0.35
+    max_attempts: 22
+  floor_prop_layout:
+    keepout_zone_ids: [main_corridor]
+    xy_jitter_m: [1.15, 1.15]
+    yaw_jitter_deg: [-28.0, 28.0]
+    uniform_scale_range: [0.90, 1.12]
+    collision_margin_m: 0.18
+    max_attempts: 18
+  copied_floor_clutter:
+    keepout_zone_ids: [main_corridor]
+    spawn_count_range: [5, 8]
+    yaw_jitter_deg: [-15.0, 15.0]
+    uniform_scale_range: [0.90, 1.15]
+    collision_margin_m: 0.16
+    max_attempts: 22

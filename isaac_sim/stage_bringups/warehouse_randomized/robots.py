@@ -198,12 +198,16 @@ class RobotAdapter:
         stage = get_stage()
         tag_root = f"{root_prim_path}/IdTag"
         ensure_xform_path(tag_root)
-        set_xform_pose(tag_root, (0.0, 0.0, 0.55), yaw_deg=0.0)
+        set_xform_pose(tag_root, (0.0, 0.0, 0.78), yaw_deg=0.0)
 
-        plaque_path = f"{tag_root}/Plaque"
-        plaque = UsdGeom.Cube.Define(stage, plaque_path)
-        set_xform_pose(plaque_path, (0.0, 0.0, 0.0), scale_xyz=(0.12, 0.02, 0.18))
-        plaque.GetDisplayColorAttr().Set(Vt.Vec3fArray([Gf.Vec3f(0.03, 0.03, 0.03)]))
+        white = Vt.Vec3fArray([Gf.Vec3f(0.98, 0.98, 0.96)])
+        black = Vt.Vec3fArray([Gf.Vec3f(0.06, 0.06, 0.06)])
+        accent = Vt.Vec3fArray([Gf.Vec3f(0.96, 0.46, 0.12)])
+
+        def _define_cube(path: str, position_xyz: tuple[float, float, float], scale_xyz: tuple[float, float, float], color) -> None:
+            cube = UsdGeom.Cube.Define(stage, path)
+            set_xform_pose(path, position_xyz, yaw_deg=0.0, scale_xyz=scale_xyz)
+            cube.GetDisplayColorAttr().Set(color)
 
         seven_segment = {
             0: ("a", "b", "c", "d", "e", "f"),
@@ -217,23 +221,74 @@ class RobotAdapter:
             8: ("a", "b", "c", "d", "e", "f", "g"),
             9: ("a", "b", "c", "d", "f", "g"),
         }
-        segment_layout = {
-            "a": ((0.0, 0.0, 0.07), (0.055, 0.01, 0.01)),
-            "b": ((0.045, 0.0, 0.035), (0.01, 0.01, 0.04)),
-            "c": ((0.045, 0.0, -0.035), (0.01, 0.01, 0.04)),
-            "d": ((0.0, 0.0, -0.07), (0.055, 0.01, 0.01)),
-            "e": ((-0.045, 0.0, -0.035), (0.01, 0.01, 0.04)),
-            "f": ((-0.045, 0.0, 0.035), (0.01, 0.01, 0.04)),
-            "g": ((0.0, 0.0, 0.0), (0.055, 0.01, 0.01)),
-        }
-        color = Vt.Vec3fArray([Gf.Vec3f(0.95, 0.15, 0.15)])
+
+        def _segment_layout_for_plane(plane: str, *, mirror_horizontal: bool) -> dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]]:
+            x_sign = -1.0 if mirror_horizontal else 1.0
+            if plane == "xy":
+                return {
+                    "a": ((0.0, 0.055, 0.0), (0.055, 0.008, 0.004)),
+                    "b": ((0.040 * x_sign, 0.028, 0.0), (0.008, 0.040, 0.004)),
+                    "c": ((0.040 * x_sign, -0.028, 0.0), (0.008, 0.040, 0.004)),
+                    "d": ((0.0, -0.055, 0.0), (0.055, 0.008, 0.004)),
+                    "e": ((-0.040 * x_sign, -0.028, 0.0), (0.008, 0.040, 0.004)),
+                    "f": ((-0.040 * x_sign, 0.028, 0.0), (0.008, 0.040, 0.004)),
+                    "g": ((0.0, 0.0, 0.0), (0.055, 0.008, 0.004)),
+                }
+            if plane == "xz":
+                return {
+                    "a": ((0.0, 0.0, 0.050), (0.055, 0.004, 0.008)),
+                    "b": ((0.040 * x_sign, 0.0, 0.025), (0.008, 0.004, 0.034)),
+                    "c": ((0.040 * x_sign, 0.0, -0.025), (0.008, 0.004, 0.034)),
+                    "d": ((0.0, 0.0, -0.050), (0.055, 0.004, 0.008)),
+                    "e": ((-0.040 * x_sign, 0.0, -0.025), (0.008, 0.004, 0.034)),
+                    "f": ((-0.040 * x_sign, 0.0, 0.025), (0.008, 0.004, 0.034)),
+                    "g": ((0.0, 0.0, 0.0), (0.055, 0.004, 0.008)),
+                }
+            return {
+                "a": ((0.0, 0.050, 0.0), (0.004, 0.055, 0.008)),
+                "b": ((0.0, 0.025 * x_sign, 0.040), (0.004, 0.034, 0.008)),
+                "c": ((0.0, -0.025 * x_sign, 0.040), (0.004, 0.034, 0.008)),
+                "d": ((0.0, -0.050, 0.0), (0.004, 0.055, 0.008)),
+                "e": ((0.0, -0.025 * x_sign, -0.040), (0.004, 0.034, 0.008)),
+                "f": ((0.0, 0.025 * x_sign, -0.040), (0.004, 0.034, 0.008)),
+                "g": ((0.0, 0.0, 0.0), (0.004, 0.055, 0.008)),
+            }
+
+        def _build_digit(panel_path: str, plane: str, *, mirror_horizontal: bool) -> None:
+            segment_layout = _segment_layout_for_plane(plane, mirror_horizontal=mirror_horizontal)
+            for segment_name in segments:
+                center_xyz, scale_xyz = segment_layout[segment_name]
+                _define_cube(
+                    f"{panel_path}/{segment_name}",
+                    center_xyz,
+                    scale_xyz,
+                    black,
+                )
+
         segments = seven_segment[int(robot_index % 10)]
-        for segment_name in segments:
-            center_xyz, scale_xyz = segment_layout[segment_name]
-            segment_path = f"{tag_root}/{segment_name}"
-            segment_prim = UsdGeom.Cube.Define(stage, segment_path)
-            set_xform_pose(segment_path, center_xyz, yaw_deg=0.0, scale_xyz=scale_xyz)
-            segment_prim.GetDisplayColorAttr().Set(color)
+
+        _define_cube(f"{tag_root}/Mast", (0.0, 0.0, -0.16), (0.015, 0.015, 0.20), accent)
+        _define_cube(f"{tag_root}/TopPlate", (0.0, 0.0, 0.07), (0.175, 0.175, 0.012), white)
+        _define_cube(f"{tag_root}/TopRim", (0.0, 0.0, 0.084), (0.185, 0.185, 0.004), accent)
+
+        top_digit_root = f"{tag_root}/TopDigit"
+        ensure_xform_path(top_digit_root)
+        set_xform_pose(top_digit_root, (0.0, 0.0, 0.085), yaw_deg=0.0)
+        _build_digit(top_digit_root, "xy", mirror_horizontal=False)
+
+        side_panels = (
+            ("FrontPanel", (0.0, 0.105, 0.01), (0.170, 0.012, 0.125), "xz", False),
+            ("BackPanel", (0.0, -0.105, 0.01), (0.170, 0.012, 0.125), "xz", True),
+            ("LeftPanel", (-0.105, 0.0, 0.01), (0.012, 0.170, 0.125), "yz", False),
+            ("RightPanel", (0.105, 0.0, 0.01), (0.012, 0.170, 0.125), "yz", True),
+        )
+        for panel_name, position_xyz, scale_xyz, plane, mirror_horizontal in side_panels:
+            panel_path = f"{tag_root}/{panel_name}"
+            _define_cube(panel_path, position_xyz, scale_xyz, white)
+            digit_root = f"{panel_path}/Digit"
+            ensure_xform_path(digit_root)
+            set_xform_pose(digit_root, (0.0, 0.0, 0.0), yaw_deg=0.0)
+            _build_digit(digit_root, plane, mirror_horizontal=mirror_horizontal)
 
 
 class NovaCarterAdapter(RobotAdapter):

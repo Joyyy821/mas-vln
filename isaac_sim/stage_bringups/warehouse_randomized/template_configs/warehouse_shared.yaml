@@ -1,0 +1,180 @@
+description: Shared warehouse defaults for manually authored warehouse_template_<id>.usd scenes.
+
+template_assets:
+  usd_root_dir: isaac_sim/usd
+  usd_filename_glob: warehouse_template_*.usd
+  template_id_regex: '^warehouse_template_(\d+)\.usd$'
+
+metadata:
+  template_family: warehouse_randomized_v2
+  starter_template: true
+
+nav2_map:
+  resolution_m: 0.05
+  origin_hint_xyz: [-11.975, -17.975, 0.0]
+  min_bound_xyz: [-11.975, -17.975, 0.1]
+  max_bound_xyz: [11.975, 20.825, 2.0]
+
+mapf_map:
+  resolution_m: 0.2
+  origin_hint_xyz: [-11.975, -17.975, 0.0]
+  min_bound_xyz: [-11.975, -17.975, 0.1]
+  max_bound_xyz: [12.025, 20.825, 2.0]
+
+focus_group_names: [focus_objects]
+focus_distance_range_m: [2.5, 5.25]
+
+keepout_zones:
+  - zone_id: main_corridor
+    min_xy: [-2.0, -16.0]
+    max_xy: [2.2, 18.8]
+    description: Preserve a wide navigable corridor through the middle of the warehouse.
+  - zone_id: center_loading_pad
+    min_xy: [-4.0, -1.2]
+    max_xy: [4.0, 4.8]
+    description: Optional extra keepout used by the open preset.
+
+placement_zones:
+  - zone_id: forklift_south_east
+    zone_type: anchor
+    min_xyz: [2.0, -7.8, 0.0]
+    max_xyz: [6.8, -1.2, 2.5]
+  - zone_id: forklift_south_west
+    zone_type: anchor
+    min_xyz: [-10.8, -8.0, 0.0]
+    max_xyz: [-5.8, -1.0, 2.5]
+  - zone_id: forklift_center_east
+    zone_type: anchor
+    min_xyz: [3.4, 1.0, 0.0]
+    max_xyz: [8.4, 6.4, 2.5]
+  - zone_id: floor_south
+    zone_type: support
+    min_xyz: [-10.5, -16.5, 0.0]
+    max_xyz: [9.0, -8.0, 2.0]
+  - zone_id: floor_center_left
+    zone_type: support
+    min_xyz: [-10.5, 1.0, 0.0]
+    max_xyz: [-4.2, 8.8, 2.0]
+  - zone_id: floor_center_right
+    zone_type: support
+    min_xyz: [4.2, 1.0, 0.0]
+    max_xyz: [10.5, 8.8, 2.0]
+  - zone_id: floor_north
+    zone_type: support
+    min_xyz: [-10.0, 11.0, 0.0]
+    max_xyz: [10.0, 18.5, 2.0]
+
+object_groups:
+  - group_id: forklifts
+    required: true
+    root_mode: nearest_xform
+    selectors:
+      - mode: exact_path
+        value: /World/Env/Warehouse/Forklift
+      - mode: exact_path
+        value: /World/Env/Warehouse/Forklift_01
+  - group_id: focus_objects
+    required: true
+    root_mode: nearest_xform
+    selectors:
+      - mode: exact_path
+        value: /World/Env/Warehouse/Forklift
+  - group_id: floor_props
+    required: true
+    root_mode: nearest_xform
+    selectors:
+      - mode: exact_path
+        value: /World/Env/Warehouse/SM_CardBoxC_01
+      - mode: exact_path
+        value: /World/Env/Warehouse/SM_CardBoxD_02
+      - mode: exact_path
+        value: /World/Env/Warehouse/Warehouse_Empty_small_realtime/SM_CardBoxA_02
+  - group_id: small_loose_props
+    required: true
+    root_mode: nearest_xform
+    selectors:
+      - mode: exact_path
+        value: /World/Env/Warehouse/SM_CardBoxC_01
+      - mode: exact_path
+        value: /World/Env/Warehouse/SM_CardBoxD_02
+      - mode: exact_path
+        value: /World/Env/Warehouse/Warehouse_Empty_small_realtime/SM_CardBoxA_02
+  - group_id: appearance_props
+    required: false
+    root_mode: nearest_xform
+    selectors:
+      - mode: exact_path
+        value: /World/Env/Warehouse/SM_CardBoxC_01
+      - mode: exact_path
+        value: /World/Env/Warehouse/SM_CardBoxD_02
+      - mode: exact_path
+        value: /World/Env/Warehouse/Warehouse_Empty_small_realtime/SM_CardBoxA_02
+      - mode: exact_path
+        value: /World/Env/Warehouse/Warehouse_Empty_small_realtime/KLT_Bins
+  - group_id: shelves
+    required: false
+    root_mode: nearest_xform
+    selectors:
+      - mode: regex
+        value: (?i)(shelf|rack)
+  - group_id: shelf_props
+    required: false
+    root_mode: nearest_xform
+    selectors:
+      - mode: regex
+        value: (?i)(bucket|board|wood|plank|paint)
+
+light_randomizers:
+  - name: warehouse_lights
+    selectors:
+      - mode: regex
+        value: (?i)(RectLight|SphereLight|DomeLight)
+    intensity_range: [650.0, 980.0]
+    color_value_range:
+      - [0.88, 1.0]
+      - [0.88, 1.0]
+      - [0.85, 0.98]
+    temperature_range: [3600.0, 5200.0]
+
+object_randomizers:
+  - name: appearance_props_colors
+    policy: appearance_only
+    target_group_name: appearance_props
+    color_value_range:
+      - [0.40, 0.95]
+      - [0.40, 0.95]
+      - [0.40, 0.95]
+  - name: forklift_layout
+    policy: jittered_existing
+    target_group_name: forklifts
+    anchor_zone_ids: [forklift_south_east, forklift_south_west, forklift_center_east]
+    keepout_zone_ids: [main_corridor]
+    snapped_yaw_deg: [0, 90, 180, 270]
+    xy_jitter_m: [0.9, 0.9]
+    yaw_jitter_deg: [-20.0, 20.0]
+    uniform_scale_range: [1.0, 1.0]
+    collision_margin_m: 0.35
+    max_attempts: 18
+    required: true
+  - name: floor_prop_layout
+    policy: jittered_existing
+    target_group_name: floor_props
+    support_zone_ids: [floor_south, floor_center_left, floor_center_right, floor_north]
+    keepout_zone_ids: [main_corridor]
+    snapped_yaw_deg: [0, 90, 180, 270]
+    xy_jitter_m: [0.8, 0.8]
+    yaw_jitter_deg: [-18.0, 18.0]
+    uniform_scale_range: [0.95, 1.08]
+    collision_margin_m: 0.18
+    max_attempts: 16
+  - name: copied_floor_clutter
+    policy: copied_from_group
+    source_group_name: small_loose_props
+    support_zone_ids: [floor_south, floor_center_left, floor_center_right, floor_north]
+    keepout_zone_ids: [main_corridor]
+    spawn_count_range: [3, 5]
+    snapped_yaw_deg: [0, 90, 180, 270]
+    yaw_jitter_deg: [-10.0, 10.0]
+    uniform_scale_range: [0.95, 1.10]
+    collision_margin_m: 0.16
+    max_attempts: 20

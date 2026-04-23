@@ -86,6 +86,53 @@ def _reshape_generator_buffer(
     )
 
 
+def _write_map_artifacts(
+    *,
+    yaml_path: str | Path,
+    resolution_m: float,
+    origin_hint_xyz: Sequence[float],
+    min_bound_xyz: Sequence[float],
+    max_bound_xyz: Sequence[float],
+    image_buffer: np.ndarray,
+) -> MapExportResult:
+    yaml_path = Path(yaml_path).expanduser().resolve()
+    yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    png_path = yaml_path.with_suffix(".png")
+
+    image = Image.fromarray(np.asarray(image_buffer, dtype=np.uint8), mode="L")
+    image.save(png_path)
+
+    payload = {
+        "image": png_path.name,
+        "resolution": float(resolution_m),
+        "origin": [float(origin_hint_xyz[0]), float(origin_hint_xyz[1]), float(origin_hint_xyz[2])],
+        "negate": 0,
+        "occupied_thresh": DEFAULT_OCCUPIED_THRESH,
+        "free_thresh": DEFAULT_FREE_THRESH,
+    }
+    with yaml_path.open("w", encoding="utf-8") as stream:
+        yaml.safe_dump(payload, stream, sort_keys=False)
+
+    occupied_cells = int(np.count_nonzero(image_buffer == DEFAULT_OCCUPIED_PIXEL))
+    free_cells = int(np.count_nonzero(image_buffer == DEFAULT_FREE_PIXEL))
+    unknown_cells = int(np.count_nonzero(image_buffer == DEFAULT_UNKNOWN_PIXEL))
+    height_px, width_px = image_buffer.shape[:2]
+
+    return MapExportResult(
+        yaml_path=yaml_path,
+        png_path=png_path,
+        resolution_m=float(resolution_m),
+        origin_xyz=(float(origin_hint_xyz[0]), float(origin_hint_xyz[1]), float(origin_hint_xyz[2])),
+        min_bound_xyz=(float(min_bound_xyz[0]), float(min_bound_xyz[1]), float(min_bound_xyz[2])),
+        max_bound_xyz=(float(max_bound_xyz[0]), float(max_bound_xyz[1]), float(max_bound_xyz[2])),
+        width_px=int(width_px),
+        height_px=int(height_px),
+        occupied_cells=occupied_cells,
+        free_cells=free_cells,
+        unknown_cells=unknown_cells,
+    )
+
+
 def export_occupancy_map(
     *,
     yaml_path: str | Path,
@@ -98,10 +145,6 @@ def export_occupancy_map(
     import omni.physx
     import omni.usd
     from isaacsim.asset.gen.omap.bindings import _omap
-
-    yaml_path = Path(yaml_path).expanduser().resolve()
-    yaml_path.parent.mkdir(parents=True, exist_ok=True)
-    png_path = yaml_path.with_suffix(".png")
 
     physx = omni.physx.acquire_physx_interface()
     stage_id = omni.usd.get_context().get_stage_id()
@@ -139,32 +182,70 @@ def export_occupancy_map(
     image_buffer[raw_buffer == 5] = DEFAULT_FREE_PIXEL
     image_buffer[raw_buffer == 6] = DEFAULT_UNKNOWN_PIXEL
     # ROS occupancy-map YAML uses a lower-left origin, while image rows are top-first.
-    image = Image.fromarray(np.flipud(image_buffer), mode="L")
-    image.save(png_path)
-
-    payload = {
-        "image": png_path.name,
-        "resolution": float(resolution_m),
-        "origin": [float(origin_hint_xyz[0]), float(origin_hint_xyz[1]), float(origin_hint_xyz[2])],
-        "negate": 0,
-        "occupied_thresh": DEFAULT_OCCUPIED_THRESH,
-        "free_thresh": DEFAULT_FREE_THRESH,
-    }
-    with yaml_path.open("w", encoding="utf-8") as stream:
-        yaml.safe_dump(payload, stream, sort_keys=False)
-
-    return MapExportResult(
+    return _write_map_artifacts(
         yaml_path=yaml_path,
-        png_path=png_path,
-        resolution_m=float(resolution_m),
-        origin_xyz=(float(origin_hint_xyz[0]), float(origin_hint_xyz[1]), float(origin_hint_xyz[2])),
-        min_bound_xyz=(float(min_bound_xyz[0]), float(min_bound_xyz[1]), float(min_bound_xyz[2])),
-        max_bound_xyz=(float(max_bound_xyz[0]), float(max_bound_xyz[1]), float(max_bound_xyz[2])),
-        width_px=width_px,
-        height_px=height_px,
-        occupied_cells=int(np.count_nonzero(raw_buffer == 4)),
-        free_cells=int(np.count_nonzero(raw_buffer == 5)),
-        unknown_cells=int(np.count_nonzero(raw_buffer == 6)),
+        resolution_m=resolution_m,
+        origin_hint_xyz=origin_hint_xyz,
+        min_bound_xyz=min_bound_xyz,
+        max_bound_xyz=max_bound_xyz,
+        image_buffer=np.flipud(image_buffer),
+    )
+
+
+def export_bbox_occupancy_map(
+    *,
+    yaml_path: str | Path,
+    resolution_m: float,
+    origin_hint_xyz: Sequence[float],
+    min_bound_xyz: Sequence[float],
+    max_bound_xyz: Sequence[float],
+    obstacle_bboxes: Sequence[tuple[Sequence[float], Sequence[float]]],
+) -> MapExportResult:
+    width_px, height_px = _expected_dim_xy(
+        resolution_m=resolution_m,
+        min_bound_xyz=min_bound_xyz,
+        max_bound_xyz=max_bound_xyz,
+    )
+    image_buffer = np.full((height_px, width_px), DEFAULT_FREE_PIXEL, dtype=np.uint8)
+
+    origin_x = float(origin_hint_xyz[0])
+    origin_y = float(origin_hint_xyz[1])
+    max_x = float(origin_hint_xyz[0]) + width_px * float(resolution_m)
+    max_y = float(origin_hint_xyz[1]) + height_px * float(resolution_m)
+
+    for bbox_min_xyz, bbox_max_xyz in obstacle_bboxes:
+        min_x = max(float(bbox_min_xyz[0]), origin_x)
+        min_y = max(float(bbox_min_xyz[1]), origin_y)
+        max_x_bbox = min(float(bbox_max_xyz[0]), max_x)
+        max_y_bbox = min(float(bbox_max_xyz[1]), max_y)
+        if max_x_bbox <= min_x or max_y_bbox <= min_y:
+            continue
+
+        col_min = int(np.floor((min_x - origin_x) / float(resolution_m)))
+        col_max = int(np.ceil((max_x_bbox - origin_x) / float(resolution_m))) - 1
+        row_bottom_min = int(np.floor((min_y - origin_y) / float(resolution_m)))
+        row_bottom_max = int(np.ceil((max_y_bbox - origin_y) / float(resolution_m))) - 1
+        if col_max < 0 or row_bottom_max < 0 or col_min >= width_px or row_bottom_min >= height_px:
+            continue
+
+        col_min = max(0, col_min)
+        col_max = min(width_px - 1, col_max)
+        row_bottom_min = max(0, row_bottom_min)
+        row_bottom_max = min(height_px - 1, row_bottom_max)
+        if col_min > col_max or row_bottom_min > row_bottom_max:
+            continue
+
+        row_min = height_px - 1 - row_bottom_max
+        row_max = height_px - 1 - row_bottom_min
+        image_buffer[row_min : row_max + 1, col_min : col_max + 1] = DEFAULT_OCCUPIED_PIXEL
+
+    return _write_map_artifacts(
+        yaml_path=yaml_path,
+        resolution_m=resolution_m,
+        origin_hint_xyz=origin_hint_xyz,
+        min_bound_xyz=min_bound_xyz,
+        max_bound_xyz=max_bound_xyz,
+        image_buffer=image_buffer,
     )
 
 

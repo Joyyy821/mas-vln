@@ -1,0 +1,44 @@
+variant_id: open
+description: Open starter template with lighter clutter and larger free corridors.
+metadata:
+  layout_class: open
+
+focus_distance_range_m: [2.5, 5.75]
+
+light_randomizer_overrides:
+  warehouse_lights:
+    intensity_range: [700.0, 900.0]
+    color_value_range:
+      - [0.92, 1.0]
+      - [0.92, 1.0]
+      - [0.90, 1.0]
+    temperature_range: [4000.0, 5400.0]
+
+object_randomizer_overrides:
+  appearance_props_colors:
+    color_value_range:
+      - [0.50, 0.95]
+      - [0.50, 0.95]
+      - [0.50, 0.95]
+  forklift_layout:
+    anchor_zone_ids: [forklift_south_east, forklift_south_west]
+    keepout_zone_ids: [main_corridor, center_loading_pad]
+    xy_jitter_m: [0.7, 0.7]
+    yaw_jitter_deg: [-12.0, 12.0]
+    uniform_scale_range: [1.0, 1.0]
+    collision_margin_m: 0.35
+    max_attempts: 16
+  floor_prop_layout:
+    keepout_zone_ids: [main_corridor, center_loading_pad]
+    xy_jitter_m: [0.55, 0.55]
+    yaw_jitter_deg: [-12.0, 12.0]
+    uniform_scale_range: [0.98, 1.05]
+    collision_margin_m: 0.16
+    max_attempts: 14
+  copied_floor_clutter:
+    keepout_zone_ids: [main_corridor, center_loading_pad]
+    spawn_count_range: [1, 2]
+    yaw_jitter_deg: [-8.0, 8.0]
+    uniform_scale_range: [0.98, 1.05]
+    collision_margin_m: 0.14
+    max_attempts: 16

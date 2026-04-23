@@ -1,0 +1,44 @@
+variant_id: balanced
+description: Moderate geometry-first randomization around the reference warehouse layout.
+metadata:
+  layout_class: balanced
+
+focus_distance_range_m: [2.5, 5.25]
+
+light_randomizer_overrides:
+  warehouse_lights:
+    intensity_range: [650.0, 980.0]
+    color_value_range:
+      - [0.88, 1.0]
+      - [0.88, 1.0]
+      - [0.85, 0.98]
+    temperature_range: [3600.0, 5200.0]
+
+object_randomizer_overrides:
+  appearance_props_colors:
+    color_value_range:
+      - [0.40, 0.95]
+      - [0.40, 0.95]
+      - [0.40, 0.95]
+  forklift_layout:
+    anchor_zone_ids: [forklift_south_east, forklift_south_west, forklift_center_east]
+    keepout_zone_ids: [main_corridor]
+    xy_jitter_m: [0.9, 0.9]
+    yaw_jitter_deg: [-20.0, 20.0]
+    uniform_scale_range: [1.0, 1.0]
+    collision_margin_m: 0.35
+    max_attempts: 18
+  floor_prop_layout:
+    keepout_zone_ids: [main_corridor]
+    xy_jitter_m: [0.8, 0.8]
+    yaw_jitter_deg: [-18.0, 18.0]
+    uniform_scale_range: [0.95, 1.08]
+    collision_margin_m: 0.18
+    max_attempts: 16
+  copied_floor_clutter:
+    keepout_zone_ids: [main_corridor]
+    spawn_count_range: [3, 5]
+    yaw_jitter_deg: [-10.0, 10.0]
+    uniform_scale_range: [0.95, 1.10]
+    collision_margin_m: 0.16
+    max_attempts: 20
