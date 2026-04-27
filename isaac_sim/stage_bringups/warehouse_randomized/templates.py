@@ -110,6 +110,10 @@ class TemplateMapSpec:
     origin_hint_xyz: tuple[float, float, float]
     min_bound_xyz: tuple[float, float, float]
     max_bound_xyz: tuple[float, float, float]
+    occupancy_z_range_m: tuple[float, float] | None = None
+    ground_contact_max_z_m: float | None = None
+    obstacle_group_names: tuple[str, ...] = ()
+    include_outer_bounds_perimeter: bool = False
 
 
 @dataclass(frozen=True)
@@ -281,6 +285,14 @@ def _parse_map_spec(raw_value: Mapping[str, Any], *, field_name: str) -> Templat
         ),
         max_bound_xyz=_as_float_tuple(
             raw_value["max_bound_xyz"], length=3, field_name=f"{field_name}.max_bound_xyz"
+        ),
+        occupancy_z_range_m=(
+            None
+            if raw_value.get("occupancy_z_range_m") is None
+            else _as_range_tuple(
+                raw_value["occupancy_z_range_m"],
+                field_name=f"{field_name}.occupancy_z_range_m",
+            )
         ),
     )
 

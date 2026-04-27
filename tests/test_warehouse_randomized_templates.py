@@ -30,12 +30,20 @@ def _shared_defaults_payload() -> dict:
             "origin_hint_xyz": [0.0, 0.0, 0.0],
             "min_bound_xyz": [0.0, 0.0, 0.0],
             "max_bound_xyz": [10.0, 10.0, 2.0],
+            "occupancy_z_range_m": [0.1, 0.62],
+            "ground_contact_max_z_m": 0.22,
+            "obstacle_group_names": ["forklifts"],
+            "include_outer_bounds_perimeter": True,
         },
         "mapf_map": {
             "resolution_m": 0.2,
             "origin_hint_xyz": [0.0, 0.0, 0.0],
             "min_bound_xyz": [0.0, 0.0, 0.0],
             "max_bound_xyz": [10.0, 10.0, 2.0],
+            "occupancy_z_range_m": [0.1, 0.62],
+            "ground_contact_max_z_m": 0.22,
+            "obstacle_group_names": ["forklifts"],
+            "include_outer_bounds_perimeter": True,
         },
         "focus_group_names": ["focus_objects"],
         "focus_distance_range_m": [2.0, 5.0],
@@ -134,6 +142,24 @@ def _open_preset_payload() -> dict:
 
 
 class WarehouseRandomizedTemplateTests(unittest.TestCase):
+    def test_repo_shared_defaults_use_omap_only_map_schema(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        shared_defaults_path = (
+            repo_root
+            / "isaac_sim"
+            / "stage_bringups"
+            / "warehouse_randomized"
+            / "template_configs"
+            / "warehouse_shared.yaml"
+        )
+        payload = yaml.safe_load(shared_defaults_path.read_text(encoding="utf-8"))
+
+        for map_key in ("nav2_map", "mapf_map"):
+            self.assertEqual(payload[map_key]["occupancy_z_range_m"], [0.1, 0.62])
+            self.assertNotIn("ground_contact_max_z_m", payload[map_key])
+            self.assertNotIn("obstacle_group_names", payload[map_key])
+            self.assertNotIn("include_outer_bounds_perimeter", payload[map_key])
+
     def test_discover_template_assets_parses_numeric_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
@@ -193,6 +219,14 @@ class WarehouseRandomizedTemplateTests(unittest.TestCase):
             self.assertEqual(open_template.preset_config_path, (config_dir / "warehouse_open.yaml").resolve())
             self.assertEqual(open_template.light_randomizers[0].intensity_range, (250.0, 300.0))
             self.assertEqual(open_template.focus_distance_range_m, (3.0, 6.0))
+            self.assertEqual(open_template.nav2_map.occupancy_z_range_m, (0.1, 0.62))
+            self.assertEqual(open_template.mapf_map.occupancy_z_range_m, (0.1, 0.62))
+            self.assertEqual(open_template.nav2_map.ground_contact_max_z_m, None)
+            self.assertEqual(open_template.mapf_map.ground_contact_max_z_m, None)
+            self.assertEqual(open_template.nav2_map.obstacle_group_names, ())
+            self.assertEqual(open_template.mapf_map.obstacle_group_names, ())
+            self.assertFalse(open_template.nav2_map.include_outer_bounds_perimeter)
+            self.assertFalse(open_template.mapf_map.include_outer_bounds_perimeter)
             self.assertEqual(open_template.metadata["layout_class"], "open")
 
             randomizer_names = [randomizer.name for randomizer in open_template.object_randomizers]

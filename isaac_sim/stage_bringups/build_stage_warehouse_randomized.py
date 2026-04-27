@@ -34,7 +34,6 @@ from isaac_sim.stage_bringups.warehouse_randomized.templates import (  # noqa: E
 
 DEFAULT_SCENE_ROOT_DIR = REPO_ROOT / "experiments" / "randomized_warehouse"
 DEFAULT_REFERENCE_CONFIG = REPO_ROOT / "data_configs" / "warehouse" / "warehouse_forklift.yaml"
-DEFAULT_MAP_EXPORT_MODE = os.environ.get("WAREHOUSE_MAP_EXPORT_MODE", "bbox").strip().lower() or "bbox"
 DEFAULT_ROLLOUT_CONTROL_TOPIC = os.environ.get(
     "CARTER_ROLLOUT_CONTROL_TOPIC",
     "/carters_goal/rollout_control",
@@ -92,6 +91,42 @@ def _build_scene_id(template_id: str, variant_id: str, scene_id_prefix: str = ""
     return base_scene_id if not clean_prefix else f"{clean_prefix}_{base_scene_id}"
 
 
+def _normalize_variant_ids(variant_ids: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    raw_variant_ids = tuple(variant_ids or DEFAULT_VARIANT_IDS)
+    normalized_variant_ids: list[str] = []
+    seen: set[str] = set()
+    for variant_id in raw_variant_ids:
+        clean_variant_id = str(variant_id).strip()
+        if not clean_variant_id or clean_variant_id in seen:
+            continue
+        normalized_variant_ids.append(clean_variant_id)
+        seen.add(clean_variant_id)
+    if not normalized_variant_ids:
+        normalized_variant_ids = list(DEFAULT_VARIANT_IDS)
+
+    invalid_variant_ids = [variant_id for variant_id in normalized_variant_ids if variant_id not in DEFAULT_VARIANT_IDS]
+    if invalid_variant_ids:
+        raise ValueError(
+            f"Unknown variant id(s) {invalid_variant_ids}. Available variants: {list(DEFAULT_VARIANT_IDS)}"
+        )
+    return tuple(normalized_variant_ids)
+
+
+def _parse_selected_variant_ids(*, variants: list[str], base_only: bool) -> tuple[str, ...]:
+    if base_only and variants:
+        raise ValueError("--base-only cannot be combined with --variant.")
+    if base_only:
+        return (DEFAULT_BASE_VARIANT_ID,)
+
+    requested_variant_ids: list[str] = []
+    for value in variants:
+        for token in str(value).split(","):
+            clean_token = token.strip()
+            if clean_token:
+                requested_variant_ids.append(clean_token)
+    return _normalize_variant_ids(tuple(requested_variant_ids) if requested_variant_ids else None)
+
+
 def plan_bundle_specs(
     *,
     available_template_ids: list[str],
@@ -106,6 +141,7 @@ def plan_bundle_specs(
         raise ValueError("No template ids are available for planning.")
     if all_template and str(scene_id_prefix).strip():
         raise ValueError("--scene-id cannot be used together with --all_template.")
+    selected_variant_ids = _normalize_variant_ids(variant_ids)
 
     clean_requested_template_id = str(requested_template_id).strip()
     if all_template:
@@ -121,7 +157,7 @@ def plan_bundle_specs(
 
     specs: list[BundleBuildSpec] = []
     for template_id in selected_template_ids:
-        for variant_id in variant_ids:
+        for variant_id in selected_variant_ids:
             specs.append(
                 BundleBuildSpec(
                     template_id=template_id,
@@ -166,6 +202,20 @@ def _parse_args() -> argparse.Namespace:
             "Manual warehouse template id parsed from warehouse_template_<id>.usd. "
             "Defaults to the first discovered template when omitted."
         ),
+    )
+    parser.add_argument(
+        "--variant",
+        action="append",
+        default=[],
+        help=(
+            "Variant id(s) to generate. May be passed multiple times or as a comma-separated list, "
+            "for example '--variant base' or '--variant base,balanced'. Defaults to all variants."
+        ),
+    )
+    parser.add_argument(
+        "--base-only",
+        action="store_true",
+        help="Fast debug shortcut that only generates the base variant.",
     )
     parser.add_argument(
         "--all_template",
@@ -238,15 +288,6 @@ def _parse_args() -> argparse.Namespace:
         help="Keep the final generated Isaac Sim bundle running after batch generation completes.",
     )
     parser.add_argument(
-        "--map-export-mode",
-        choices=("bbox", "omap"),
-        default=DEFAULT_MAP_EXPORT_MODE,
-        help=(
-            "Map export backend. 'bbox' rasterizes collision/render bounds in-process and avoids "
-            "the crashing OMAP extension; 'omap' uses isaacsim.asset.gen.omap."
-        ),
-    )
-    parser.add_argument(
         "--headless",
         dest="headless",
         action="store_true",
@@ -309,7 +350,6 @@ def _build_scene_bundle(
     enable_ros2_runtime: bool,
     rollout_control_topic: str,
     rollout_reset_done_topic: str,
-    map_export_mode: str,
     overwrite: bool,
     headless: bool,
     keep_sim_running: bool,
@@ -331,7 +371,6 @@ def _build_scene_bundle(
         enable_ros2_runtime=enable_ros2_runtime,
         rollout_control_topic=rollout_control_topic,
         rollout_reset_done_topic=rollout_reset_done_topic,
-        map_export_mode=map_export_mode,
         overwrite=overwrite,
     )
 
@@ -399,7 +438,17 @@ def main() -> int:
         REPO_ROOT,
         template_registry_dirs=template_registry_dirs,
     )
-    missing_presets = sorted(set(DEFAULT_RANDOMIZATION_VARIANT_IDS) - set(presets))
+    try:
+        selected_variant_ids = _parse_selected_variant_ids(
+            variants=list(args.variant),
+            base_only=bool(args.base_only),
+        )
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    required_preset_ids = sorted(set(selected_variant_ids) - {DEFAULT_BASE_VARIANT_ID})
+    missing_presets = sorted(set(required_preset_ids) - set(presets))
     if missing_presets:
         print(
             f"[ERROR] Missing required warehouse presets: {missing_presets}.",
@@ -423,6 +472,7 @@ def main() -> int:
             all_template=bool(args.all_template),
             scene_id_prefix=args.scene_id,
             base_seed=base_seed,
+            variant_ids=selected_variant_ids,
         )
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -472,7 +522,6 @@ def main() -> int:
                 enable_ros2_runtime=bool(args.enable_ros2_runtime) and keep_sim_running,
                 rollout_control_topic=args.rollout_control_topic,
                 rollout_reset_done_topic=args.rollout_reset_done_topic,
-                map_export_mode=args.map_export_mode,
                 overwrite=bool(args.overwrite),
                 headless=shared_headless,
                 keep_sim_running=keep_sim_running,

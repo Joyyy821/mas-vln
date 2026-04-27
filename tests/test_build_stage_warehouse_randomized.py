@@ -74,6 +74,35 @@ class BuildStageWarehouseRandomizedTests(unittest.TestCase):
         self.assertEqual(specs[0].scene_id, "trial_template_3_base")
         self.assertEqual(specs[-1].scene_id, "trial_template_3_open")
 
+    def test_plan_bundle_specs_supports_variant_subset(self) -> None:
+        specs = warehouse_cli.plan_bundle_specs(
+            available_template_ids=["1"],
+            requested_template_id="1",
+            base_seed=9,
+            variant_ids=("base", "balanced"),
+        )
+
+        self.assertEqual([spec.variant_id for spec in specs], ["base", "balanced"])
+        self.assertEqual(
+            [spec.scene_id for spec in specs],
+            ["template_1_base", "template_1_balanced"],
+        )
+
+    def test_parse_selected_variant_ids_supports_base_only_shortcut(self) -> None:
+        variant_ids = warehouse_cli._parse_selected_variant_ids(
+            variants=[],
+            base_only=True,
+        )
+
+        self.assertEqual(variant_ids, ("base",))
+
+    def test_parse_selected_variant_ids_rejects_conflicting_args(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--base-only"):
+            warehouse_cli._parse_selected_variant_ids(
+                variants=["balanced"],
+                base_only=True,
+            )
+
     def test_derive_bundle_seed_is_stable_and_variant_specific(self) -> None:
         first_seed = warehouse_cli._derive_bundle_seed(42, "1", "balanced")
         second_seed = warehouse_cli._derive_bundle_seed(42, "1", "balanced")

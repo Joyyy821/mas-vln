@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fnmatch import fnmatch
+import itertools
 import math
 from pathlib import Path
 import re
@@ -26,8 +27,8 @@ from isaac_sim.stage_bringups.runtime_utils import (
 )
 from isaac_sim.stage_bringups.warehouse_randomized.maps import (
     MapExportResult,
-    export_bbox_occupancy_map,
-    export_occupancy_map,
+    _export_occupancy_map,
+    _export_resampled_occupancy_map,
     sample_multi_robot_rollouts,
 )
 from isaac_sim.stage_bringups.warehouse_randomized.robots import (
@@ -44,6 +45,11 @@ from isaac_sim.stage_bringups.warehouse_randomized.templates import (
     TemplateMapSpec,
     WarehouseTemplate,
 )
+
+OMAP_EXTENSION_NAME = "isaacsim.asset.gen.omap"
+OMAP_DEFAULT_Z_MIN = 0.1
+OMAP_DEFAULT_Z_MAX = 0.62
+OMAP_PHYSICS_WARMUP_UPDATES = 120
 
 
 @dataclass
@@ -82,7 +88,6 @@ class RandomizedWarehouseBuilder:
         enable_ros2_runtime: bool,
         rollout_control_topic: str,
         rollout_reset_done_topic: str,
-        map_export_mode: str = "bbox",
         overwrite: bool = False,
     ) -> None:
         self._repo_root = Path(repo_root).expanduser().resolve()
@@ -96,15 +101,12 @@ class RandomizedWarehouseBuilder:
         self._enable_ros2_runtime = bool(enable_ros2_runtime)
         self._rollout_control_topic = str(rollout_control_topic).strip()
         self._rollout_reset_done_topic = str(rollout_reset_done_topic).strip()
-        self._map_export_mode = str(map_export_mode).strip().lower() or "bbox"
         self._overwrite = bool(overwrite)
 
         if self._robot_count < 2 or self._robot_count > 5:
             raise ValueError(f"robot_count must be between 2 and 5, got {self._robot_count}.")
         if self._rollout_count <= 0:
             raise ValueError("rollout_count must be positive.")
-        if self._map_export_mode not in {"bbox", "omap"}:
-            raise ValueError("map_export_mode must be either 'bbox' or 'omap'.")
 
         if not isinstance(template, WarehouseTemplate):
             raise TypeError("template must be a resolved WarehouseTemplate instance.")
@@ -157,6 +159,8 @@ class RandomizedWarehouseBuilder:
         self._resolved_nav2_map_spec: TemplateMapSpec | None = None
         self._resolved_mapf_map_spec: TemplateMapSpec | None = None
         self._map_export_debug: dict[str, Any] = {}
+        self._omap_extension_enabled = False
+        self._omap_physics_warmup_updates = 0
 
     @property
     def sim_app(self):
@@ -168,9 +172,7 @@ class RandomizedWarehouseBuilder:
         self._sim_app = maybe_start_sim_app(
             headless=headless,
             enable_ros2_bridge=self._enable_ros2_runtime,
-            extra_extensions=(
-                ["isaacsim.asset.gen.omap"] if self._map_export_mode == "omap" else []
-            ),
+            extra_extensions=(OMAP_EXTENSION_NAME,),
         )
 
     def build(self) -> RandomizedWarehouseBuildResult:
@@ -570,6 +572,74 @@ class RandomizedWarehouseBuilder:
             base_yaw_deg = float(self._rng.choice(np.array(spec.snapped_yaw_deg, dtype=float)))
         return float(base_yaw_deg + self._rng.uniform(spec.yaw_jitter_deg[0], spec.yaw_jitter_deg[1]))
 
+    def _assign_unique_anchor_zones(
+        self,
+        *,
+        object_positions_xy: dict[str, np.ndarray],
+        candidate_zones: list[PlacementZone],
+    ) -> dict[str, PlacementZone]:
+        if not object_positions_xy or len(candidate_zones) < len(object_positions_xy):
+            return {}
+
+        object_paths = list(object_positions_xy)
+        best_assignment: dict[str, PlacementZone] = {}
+        best_cost = float("inf")
+        for zone_tuple in itertools.permutations(candidate_zones, len(object_paths)):
+            total_cost = 0.0
+            for object_path, zone in zip(object_paths, zone_tuple):
+                delta_xy = self._zone_center_xy(zone) - np.array(object_positions_xy[object_path][:2], dtype=float)
+                total_cost += float(np.sum(delta_xy ** 2))
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_assignment = {
+                    object_path: zone
+                    for object_path, zone in zip(object_paths, zone_tuple)
+                }
+        return best_assignment
+
+    def _zone_center_xy(self, zone: PlacementZone) -> np.ndarray:
+        return np.array(
+            [
+                0.5 * (float(zone.min_xyz[0]) + float(zone.max_xyz[0])),
+                0.5 * (float(zone.min_xyz[1]) + float(zone.max_xyz[1])),
+            ],
+            dtype=float,
+        )
+
+    def _ordered_candidate_zones_for_object(
+        self,
+        *,
+        original_position: np.ndarray,
+        candidate_zones: list[PlacementZone],
+        reserved_zone_ids: set[str] | None = None,
+        prefer_unused: bool = False,
+    ) -> list[PlacementZone]:
+        reserved_zone_ids = set(reserved_zone_ids or set())
+        original_xy = np.array(original_position[:2], dtype=float)
+
+        def _sort_key(zone: PlacementZone) -> tuple[int, float, str]:
+            center_xy = self._zone_center_xy(zone)
+            distance_sq = float(np.sum((center_xy - original_xy) ** 2))
+            is_reserved = int(bool(prefer_unused and zone.zone_id in reserved_zone_ids))
+            return (is_reserved, distance_sq, zone.zone_id)
+
+        return sorted(candidate_zones, key=_sort_key)
+
+    def _nearest_zone_id_for_position(
+        self,
+        *,
+        position_xyz: np.ndarray,
+        candidate_zones: list[PlacementZone],
+    ) -> str:
+        if not candidate_zones:
+            return ""
+        original_xy = np.array(position_xyz[:2], dtype=float)
+        nearest_zone = min(
+            candidate_zones,
+            key=lambda zone: float(np.sum((self._zone_center_xy(zone) - original_xy) ** 2)),
+        )
+        return nearest_zone.zone_id
+
     def _sample_zone_xy(self, zone: PlacementZone) -> tuple[float, float]:
         return (
             float(self._rng.uniform(zone.min_xyz[0], zone.max_xyz[0])),
@@ -783,15 +853,44 @@ class RandomizedWarehouseBuilder:
             if zone_ids
             else []
         )
+        original_positions_by_path: dict[str, np.ndarray] = {}
+        original_orientations_by_path: dict[str, np.ndarray] = {}
+        original_yaws_by_path: dict[str, float] = {}
         for object_path in object_paths:
             original_position, original_orientation = get_world_pose_xyzw(object_path)
-            original_yaw_deg = quaternion_xyzw_to_yaw(original_orientation) * 180.0 / math.pi
+            original_positions_by_path[object_path] = original_position
+            original_orientations_by_path[object_path] = original_orientation
+            original_yaws_by_path[object_path] = (
+                quaternion_xyzw_to_yaw(original_orientation) * 180.0 / math.pi
+            )
+
+        assigned_anchor_zones: dict[str, PlacementZone] = {}
+        if spec.anchor_zone_ids:
+            assigned_anchor_zones = self._assign_unique_anchor_zones(
+                object_positions_xy=original_positions_by_path,
+                candidate_zones=candidate_zones,
+            )
+        reserve_unique_zones = bool(spec.anchor_zone_ids) and len(candidate_zones) >= len(object_paths) > 0
+        reserved_zone_ids: set[str] = set()
+        for object_path in object_paths:
+            original_position = original_positions_by_path[object_path]
+            original_orientation = original_orientations_by_path[object_path]
+            original_yaw_deg = original_yaws_by_path[object_path]
             accepted_bbox: tuple[np.ndarray, np.ndarray] | None = None
             accepted_position = original_position.copy()
             accepted_yaw_deg = original_yaw_deg
             accepted_scale = 1.0
             accepted_zone_id = ""
             accepted_from_original = True
+            if assigned_anchor_zones:
+                ordered_candidate_zones = [assigned_anchor_zones[object_path]]
+            else:
+                ordered_candidate_zones = self._ordered_candidate_zones_for_object(
+                    original_position=original_position,
+                    candidate_zones=candidate_zones,
+                    reserved_zone_ids=reserved_zone_ids,
+                    prefer_unused=reserve_unique_zones,
+                )
 
             for attempt_index in range(spec.max_attempts):
                 candidate_yaw_deg = self._sample_candidate_yaw_deg(original_yaw_deg, spec)
@@ -800,8 +899,8 @@ class RandomizedWarehouseBuilder:
                 )
                 zone_id = ""
 
-                if candidate_zones:
-                    zone = candidate_zones[int(self._rng.integers(0, len(candidate_zones)))]
+                if ordered_candidate_zones:
+                    zone = ordered_candidate_zones[attempt_index % len(ordered_candidate_zones)]
                     placement = self._place_object_in_zone(
                         object_path,
                         zone=zone,
@@ -846,6 +945,14 @@ class RandomizedWarehouseBuilder:
                 ):
                     self._record_rejection(spec.name, "layout_overlap")
                     continue
+                if self._bbox_intersects_environment_obstacles(
+                    object_path,
+                    bbox_min,
+                    bbox_max,
+                    margin_m=spec.collision_margin_m,
+                ):
+                    self._record_rejection(spec.name, "environment_overlap")
+                    continue
                 if not self._physx_overlap_clear(object_path, bbox_min, bbox_max):
                     self._record_rejection(spec.name, "physics_overlap")
                     continue
@@ -858,6 +965,11 @@ class RandomizedWarehouseBuilder:
                 accepted_from_original = False
                 break
 
+            if not accepted_zone_id and ordered_candidate_zones and reserve_unique_zones:
+                accepted_zone_id = self._nearest_zone_id_for_position(
+                    position_xyz=accepted_position,
+                    candidate_zones=ordered_candidate_zones,
+                )
             set_xform_pose(
                 object_path,
                 tuple(accepted_position.tolist()),
@@ -876,10 +988,17 @@ class RandomizedWarehouseBuilder:
                 bbox_min,
                 bbox_max,
                 margin_m=spec.collision_margin_m,
+            ) or self._bbox_intersects_environment_obstacles(
+                object_path,
+                bbox_min,
+                bbox_max,
+                margin_m=spec.collision_margin_m,
             ) or not self._physx_overlap_clear(object_path, bbox_min, bbox_max):
                 raise RuntimeError(
                     f"Object '{object_path}' from randomizer '{spec.name}' could not be placed safely."
                 )
+            if reserve_unique_zones and accepted_zone_id:
+                reserved_zone_ids.add(accepted_zone_id)
             self._append_layout_bbox(
                 prim_path=object_path,
                 bbox_min=bbox_min,
@@ -979,6 +1098,15 @@ class RandomizedWarehouseBuilder:
                     self._record_rejection(spec.name, "layout_overlap")
                     self._remove_prim(prop_path)
                     continue
+                if self._bbox_intersects_environment_obstacles(
+                    prop_path,
+                    bbox_min,
+                    bbox_max,
+                    margin_m=spec.collision_margin_m,
+                ):
+                    self._record_rejection(spec.name, "environment_overlap")
+                    self._remove_prim(prop_path)
+                    continue
                 if not self._physx_overlap_clear(prop_path, bbox_min, bbox_max):
                     self._record_rejection(spec.name, "physics_overlap")
                     self._remove_prim(prop_path)
@@ -1053,120 +1181,284 @@ class RandomizedWarehouseBuilder:
         self._focus_object = largest_bbox
 
     def _export_maps(self) -> None:
+        self._enable_omap_extension()
+        self._ensure_physics_scene()
+        self._resolved_nav2_map_spec = self._template.nav2_map
+        self._resolved_mapf_map_spec = self._template.mapf_map
+        self._initialize_physics_for_omap()
+        self._nav2_map_result = self._export_omap_map_from_spec(
+            yaml_path=self._nav2_map_path,
+            map_spec=self._resolved_nav2_map_spec,
+        )
+        if float(self._resolved_mapf_map_spec.resolution_m) >= float(self._nav2_map_result.resolution_m):
+            self._mapf_map_result = self._export_resampled_omap_map_from_source(
+                yaml_path=self._mapf_map_path,
+                map_spec=self._resolved_mapf_map_spec,
+                source_result=self._nav2_map_result,
+            )
+        else:
+            self._mapf_map_result = self._export_omap_map_from_spec(
+                yaml_path=self._mapf_map_path,
+                map_spec=self._resolved_mapf_map_spec,
+            )
+
+    def _enable_omap_extension(self) -> None:
+        try:
+            from isaacsim.core.utils.extensions import enable_extension
+        except Exception:
+            from omni.isaac.core.utils.extensions import enable_extension
+
+        enable_extension(OMAP_EXTENSION_NAME)
+        self._omap_extension_enabled = True
+        if self._sim_app is not None:
+            self._sim_app.update()
+
+    def _initialize_physics_for_omap(self, num_updates: int = OMAP_PHYSICS_WARMUP_UPDATES) -> None:
+        import omni.kit.app
         import omni.timeline
 
-        def _export_with_selected_start(
-            *,
-            yaml_path,
-            resolution_m,
-            origin_hint_xyz,
-            min_bound_xyz,
-            max_bound_xyz,
-        ):
-            map_spec = TemplateMapSpec(
-                resolution_m=float(resolution_m),
-                origin_hint_xyz=tuple(float(value) for value in origin_hint_xyz),
-                min_bound_xyz=tuple(float(value) for value in min_bound_xyz),
-                max_bound_xyz=tuple(float(value) for value in max_bound_xyz),
-            )
-            candidate_start_locations = self._candidate_map_start_locations(map_spec)
-            start_location_xyz = (
-                candidate_start_locations[0]
-                if candidate_start_locations
-                else self._choose_map_start_location(map_spec)
-            )
-            self._map_export_debug[str(yaml_path)] = {
-                "mode": "omap",
-                "candidate_start_locations_xyz": [
-                    [float(value) for value in candidate_xyz]
-                    for candidate_xyz in candidate_start_locations[:10]
-                ],
-                "chosen_start_location_xyz": [float(value) for value in start_location_xyz],
-            }
-            self._update_sim(16)
-            result = export_occupancy_map(
-                yaml_path=yaml_path,
-                resolution_m=resolution_m,
-                origin_hint_xyz=origin_hint_xyz,
-                min_bound_xyz=min_bound_xyz,
-                max_bound_xyz=max_bound_xyz,
-                start_location_xyz=start_location_xyz,
-            )
-            self._map_export_debug[str(yaml_path)]["quality_score"] = list(
-                self._map_quality_score(result)
-            )
-            return result
-
-        def _export_with_bbox_rasterization(
-            *,
-            yaml_path,
-            resolution_m,
-            origin_hint_xyz,
-            min_bound_xyz,
-            max_bound_xyz,
-        ):
-            map_spec = TemplateMapSpec(
-                resolution_m=float(resolution_m),
-                origin_hint_xyz=tuple(float(value) for value in origin_hint_xyz),
-                min_bound_xyz=tuple(float(value) for value in min_bound_xyz),
-                max_bound_xyz=tuple(float(value) for value in max_bound_xyz),
-            )
-            obstacle_bboxes, debug_payload = self._collect_bbox_map_obstacle_bboxes(map_spec)
-            self._map_export_debug[str(yaml_path)] = dict(debug_payload)
-            result = export_bbox_occupancy_map(
-                yaml_path=yaml_path,
-                resolution_m=resolution_m,
-                origin_hint_xyz=origin_hint_xyz,
-                min_bound_xyz=min_bound_xyz,
-                max_bound_xyz=max_bound_xyz,
-                obstacle_bboxes=obstacle_bboxes,
-            )
-            self._map_export_debug[str(yaml_path)]["quality_score"] = list(
-                self._map_quality_score(result)
-            )
-            return result
-
         timeline = omni.timeline.get_timeline_interface()
+        app = omni.kit.app.get_app()
         was_playing = timeline.is_playing()
+        timeline.play()
+        for _ in range(max(1, int(num_updates))):
+            if self._sim_app is not None:
+                self._sim_app.update()
+            else:
+                app.update()
         if not was_playing:
-            timeline.play()
+            pause_timeline = getattr(timeline, "pause", None)
+            if callable(pause_timeline):
+                pause_timeline()
+            else:
+                timeline.stop()
+        self._omap_physics_warmup_updates = max(1, int(num_updates))
 
-        try:
-            self._ensure_physics_scene()
-            self._resolved_nav2_map_spec = self._resolve_map_spec(self._template.nav2_map)
-            self._resolved_mapf_map_spec = self._resolve_map_spec(self._template.mapf_map)
-            export_map = (
-                _export_with_selected_start
-                if self._map_export_mode == "omap"
-                else _export_with_bbox_rasterization
-            )
-            self._nav2_map_result = export_map(
-                yaml_path=self._nav2_map_path,
-                resolution_m=self._resolved_nav2_map_spec.resolution_m,
-                origin_hint_xyz=self._resolved_nav2_map_spec.origin_hint_xyz,
-                min_bound_xyz=self._resolved_nav2_map_spec.min_bound_xyz,
-                max_bound_xyz=self._resolved_nav2_map_spec.max_bound_xyz,
-            )
-            self._mapf_map_result = export_map(
-                yaml_path=self._mapf_map_path,
-                resolution_m=self._resolved_mapf_map_spec.resolution_m,
-                origin_hint_xyz=self._resolved_mapf_map_spec.origin_hint_xyz,
-                min_bound_xyz=self._resolved_mapf_map_spec.min_bound_xyz,
-                max_bound_xyz=self._resolved_mapf_map_spec.max_bound_xyz,
-            )
-        finally:
-            if not was_playing:
-                pause_timeline = getattr(timeline, "pause", None)
-                if callable(pause_timeline):
-                    pause_timeline()
-                else:
-                    timeline.stop()
-                self._update_sim(2)
+    def _omap_z_range(self, map_spec: TemplateMapSpec) -> tuple[float, float]:
+        if map_spec.occupancy_z_range_m is None:
+            return (OMAP_DEFAULT_Z_MIN, OMAP_DEFAULT_Z_MAX)
+        return (
+            float(map_spec.occupancy_z_range_m[0]),
+            float(map_spec.occupancy_z_range_m[1]),
+        )
 
-    def _collect_bbox_map_obstacle_bboxes(
+    def _export_omap_map_from_spec(
         self,
+        *,
+        yaml_path: str | Path,
         map_spec: TemplateMapSpec,
-    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], dict[str, Any]]:
+    ) -> MapExportResult:
+        z_min, z_max = self._omap_z_range(map_spec)
+        base_debug_payload: dict[str, Any] = {
+            "rasterization_mode": "omap_generator",
+            "health_status": "running",
+            "omap_extension_name": OMAP_EXTENSION_NAME,
+            "omap_extension_enabled": bool(getattr(self, "_omap_extension_enabled", False)),
+            "physics_warmup_updates": int(getattr(self, "_omap_physics_warmup_updates", 0)),
+            "env_prim_path": self._env_prim_path,
+            "resolution_m": float(map_spec.resolution_m),
+            "z_min": float(z_min),
+            "z_max": float(z_max),
+            "omap_origin_xyz": [0.0, 0.0, 0.0],
+            "bounds_source": "environment_bbox",
+        }
+        try:
+            result = _export_occupancy_map(
+                env_prim_path=self._env_prim_path,
+                yaml_path=yaml_path,
+                resolution_m=float(map_spec.resolution_m),
+                origin_xyz=(0.0, 0.0, 0.0),
+                z_min=z_min,
+                z_max=z_max,
+                rotate_180=True,
+            )
+        except Exception as exc:
+            self._map_export_debug[str(yaml_path)] = {
+                **base_debug_payload,
+                "health_status": "failed",
+                "failure_type": type(exc).__name__,
+                "failure_message": str(exc),
+            }
+            raise
+
+        self._map_export_debug[str(yaml_path)] = {
+            **base_debug_payload,
+            **dict(result.debug),
+            "health_status": "ok",
+            "quality_score": list(self._map_quality_score(result)),
+        }
+        return result
+
+    def _export_resampled_omap_map_from_source(
+        self,
+        *,
+        yaml_path: str | Path,
+        map_spec: TemplateMapSpec,
+        source_result: MapExportResult,
+    ) -> MapExportResult:
+        z_min, z_max = self._omap_z_range(map_spec)
+        base_debug_payload: dict[str, Any] = {
+            "rasterization_mode": "omap_generator_resampled",
+            "source_rasterization_mode": "omap_generator",
+            "health_status": "running",
+            "omap_extension_name": OMAP_EXTENSION_NAME,
+            "omap_extension_enabled": bool(getattr(self, "_omap_extension_enabled", False)),
+            "physics_warmup_updates": int(getattr(self, "_omap_physics_warmup_updates", 0)),
+            "env_prim_path": self._env_prim_path,
+            "resolution_m": float(map_spec.resolution_m),
+            "z_min": float(z_min),
+            "z_max": float(z_max),
+            "bounds_source": "environment_bbox",
+        }
+        try:
+            result = _export_resampled_occupancy_map(
+                yaml_path=yaml_path,
+                source_result=source_result,
+                resolution_m=float(map_spec.resolution_m),
+            )
+        except Exception as exc:
+            self._map_export_debug[str(yaml_path)] = {
+                **base_debug_payload,
+                "health_status": "failed",
+                "failure_type": type(exc).__name__,
+                "failure_message": str(exc),
+            }
+            raise
+
+        self._map_export_debug[str(yaml_path)] = {
+            **base_debug_payload,
+            **dict(result.debug),
+            "health_status": "ok",
+            "quality_score": list(self._map_quality_score(result)),
+        }
+        return result
+
+    def _map_planar_area_m2(self) -> float:
+        map_spec = self._resolved_nav2_map_spec or self._template.nav2_map
+        span_x = float(map_spec.max_bound_xyz[0]) - float(map_spec.min_bound_xyz[0])
+        span_y = float(map_spec.max_bound_xyz[1]) - float(map_spec.min_bound_xyz[1])
+        return max(1.0, span_x * span_y)
+
+    def _obstacle_root_area_limit_m2(self) -> float:
+        return max(24.0, self._map_planar_area_m2() * 0.20)
+
+    def _bbox_intersects_occupancy_z_range(
+        self,
+        bbox_min: np.ndarray,
+        bbox_max: np.ndarray,
+        *,
+        occupancy_z_range_m: tuple[float, float] | None,
+    ) -> bool:
+        if occupancy_z_range_m is None:
+            return True
+        return not (
+            float(bbox_max[2]) <= float(occupancy_z_range_m[0])
+            or float(bbox_min[2]) >= float(occupancy_z_range_m[1])
+        )
+
+    def _is_ignored_obstacle_path(self, prim_path: str) -> bool:
+        path_lower = str(prim_path).lower()
+        return any(
+            token in path_lower
+            for token in (
+                "/looks",
+                "/materials",
+                "/shaders",
+                "light",
+                "camera",
+                "sensor",
+                "helper",
+                "visualization",
+                "debug",
+                "viz",
+                "floor",
+                "ground",
+                "ceiling",
+                "sky",
+            )
+        )
+
+    def _path_matches_any_subtree(
+        self,
+        prim_path: str,
+        root_paths: set[str] | None,
+    ) -> bool:
+        if not root_paths:
+            return False
+        clean_path = str(prim_path).strip()
+        for root_path in root_paths:
+            clean_root = str(root_path).strip()
+            if not clean_root:
+                continue
+            if clean_path == clean_root or clean_path.startswith(f"{clean_root}/"):
+                return True
+        return False
+
+    def _bbox_is_valid_obstacle_root(
+        self,
+        bbox_min: np.ndarray,
+        bbox_max: np.ndarray,
+        *,
+        max_planar_area_m2: float,
+    ) -> bool:
+        extent_xyz = bbox_max - bbox_min
+        if not (np.all(np.isfinite(bbox_min)) and np.all(np.isfinite(bbox_max))):
+            return False
+        if np.any(extent_xyz <= 0.0):
+            return False
+        if float(extent_xyz[2]) < 0.02:
+            return False
+        if float(extent_xyz[0]) < 0.02 and float(extent_xyz[1]) < 0.02:
+            return False
+        return float(extent_xyz[0] * extent_xyz[1]) <= float(max_planar_area_m2)
+
+    def _canonicalize_obstacle_root_path(
+        self,
+        prim_path: str,
+        *,
+        max_planar_area_m2: float,
+    ) -> str:
+        from pxr import UsdGeom
+
+        stage = get_stage()
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            return prim_path
+
+        candidate_path = prim_path
+        current = prim
+        if not (current.IsA(UsdGeom.Xform) or current.GetTypeName() in {"Xform", "Scope"}):
+            current = prim.GetParent()
+
+        while current and current.IsValid():
+            current_path = current.GetPath().pathString
+            if current_path in {"/", self._env_prim_path}:
+                break
+            if self._is_ignored_obstacle_path(current_path):
+                break
+            if not (current.IsA(UsdGeom.Xform) or current.GetTypeName() in {"Xform", "Scope"}):
+                current = current.GetParent()
+                continue
+            try:
+                bbox_min, bbox_max = compute_world_bbox(current_path)
+            except Exception:
+                break
+            if not self._bbox_is_valid_obstacle_root(
+                bbox_min,
+                bbox_max,
+                max_planar_area_m2=max_planar_area_m2,
+            ):
+                break
+            candidate_path = current_path
+            current = current.GetParent()
+        return candidate_path
+
+    def _collect_environment_obstacle_root_bboxes(
+        self,
+        *,
+        occupancy_z_range_m: tuple[float, float] | None = None,
+        exclude_root_paths: set[str] | None = None,
+    ) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict[str, Any]]:
         from pxr import Usd, UsdGeom
 
         try:
@@ -1174,6 +1466,7 @@ class RandomizedWarehouseBuilder:
         except Exception:
             UsdPhysics = None
 
+        exclude_paths = {str(path).strip() for path in (exclude_root_paths or set()) if str(path).strip()}
         bbox_cache = UsdGeom.BBoxCache(
             Usd.TimeCode.Default(),
             includedPurposes=[
@@ -1182,119 +1475,23 @@ class RandomizedWarehouseBuilder:
                 UsdGeom.Tokens.proxy,
             ],
         )
+        max_planar_area_m2 = self._obstacle_root_area_limit_m2()
         search_roots = [self._env_prim_path, self._randomized_props_root]
-        ignored_tokens = (
-            "/looks",
-            "/materials",
-            "/shaders",
-            "light",
-            "camera",
-            "sensor",
-            "helper",
-            "visualization",
-            "debug",
-            "viz",
-            "floor",
-            "ground",
-            "ceiling",
-            "sky",
-        )
-        map_span_x = float(map_spec.max_bound_xyz[0]) - float(map_spec.min_bound_xyz[0])
-        map_span_y = float(map_spec.max_bound_xyz[1]) - float(map_spec.min_bound_xyz[1])
-        min_obstacle_top_z = float(map_spec.min_bound_xyz[2]) + 0.08
-        seen: set[tuple[float, float, float, float, float, float]] = set()
-        obstacle_bboxes: list[tuple[np.ndarray, np.ndarray]] = []
-        debug_payload: dict[str, Any] = {
-            "mode": "bbox",
-            "collision_gprim_count": 0,
+        stats: dict[str, Any] = {
+            "obstacle_source": "environment_scan",
+            "collision_gprim_considered_count": 0,
             "collision_root_count": 0,
-            "fallback_render_gprim_count": 0,
+            "fallback_render_gprim_considered_count": 0,
             "fallback_render_root_count": 0,
-            "accepted_layout_bbox_count": 0,
-            "skipped_shell_like_count": 0,
-            "skipped_invalid_root_count": 0,
-            "obstacle_bbox_count": 0,
+            "skipped_invalid_bbox_count": 0,
+            "skipped_elevated_gprim_count": 0,
+            "skipped_large_root_count": 0,
+            "skipped_ignored_path_count": 0,
+            "skipped_excluded_subtree_count": 0,
         }
-        processed_root_paths: set[str] = set()
 
-        def _append_bbox(
-            bbox_min: np.ndarray,
-            bbox_max: np.ndarray,
-            *,
-            source_key: str,
-        ) -> bool:
-            extent_xyz = bbox_max - bbox_min
-            if not (np.all(np.isfinite(bbox_min)) and np.all(np.isfinite(bbox_max))):
-                return False
-            if np.any(extent_xyz <= 0.0):
-                return False
-            if float(bbox_max[2]) <= min_obstacle_top_z:
-                return False
-            if float(extent_xyz[2]) < 0.02:
-                return False
-            if float(extent_xyz[0]) < 0.02 and float(extent_xyz[1]) < 0.02:
-                return False
-            if (
-                float(extent_xyz[0]) > map_span_x * 0.85
-                and float(extent_xyz[1]) > map_span_y * 0.85
-            ) or (float(extent_xyz[0] * extent_xyz[1]) > (map_span_x * map_span_y * 0.60)):
-                debug_payload["skipped_shell_like_count"] += 1
-                return False
-
-            dedupe_key = tuple(
-                round(float(value), 3)
-                for value in (
-                    bbox_min[0],
-                    bbox_min[1],
-                    bbox_min[2],
-                    bbox_max[0],
-                    bbox_max[1],
-                    bbox_max[2],
-                )
-            )
-            if dedupe_key in seen:
-                return False
-            seen.add(dedupe_key)
-            obstacle_bboxes.append((np.array(bbox_min, dtype=float), np.array(bbox_max, dtype=float)))
-            debug_payload[source_key] = int(debug_payload.get(source_key, 0)) + 1
-            return True
-
-        def _root_bbox_for_map(root_path: str) -> tuple[np.ndarray, np.ndarray] | None:
-            if not root_path or root_path in processed_root_paths or root_path == self._env_prim_path:
-                return None
-            processed_root_paths.add(root_path)
-
-            root_path_lower = root_path.lower()
-            if any(token in root_path_lower for token in ignored_tokens):
-                debug_payload["skipped_invalid_root_count"] += 1
-                return None
-            try:
-                bbox_min, bbox_max = compute_world_bbox(root_path)
-            except Exception:
-                debug_payload["skipped_invalid_root_count"] += 1
-                return None
-            extent_xyz = bbox_max - bbox_min
-            if not (np.all(np.isfinite(bbox_min)) and np.all(np.isfinite(bbox_max))):
-                debug_payload["skipped_invalid_root_count"] += 1
-                return None
-            if np.any(extent_xyz <= 0.0):
-                debug_payload["skipped_invalid_root_count"] += 1
-                return None
-            if float(extent_xyz[2]) < 0.02:
-                debug_payload["skipped_invalid_root_count"] += 1
-                return None
-            if float(extent_xyz[0]) < 0.02 and float(extent_xyz[1]) < 0.02:
-                debug_payload["skipped_invalid_root_count"] += 1
-                return None
-            return bbox_min, bbox_max
-
-        def _collect_stage_bboxes(
-            *,
-            require_collision_api: bool,
-            gprim_key: str,
-            root_key: str,
-        ) -> int:
-            accepted = 0
+        def _collect(require_collision_api: bool, *, gprim_key: str, root_key: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            roots: dict[str, tuple[np.ndarray, np.ndarray]] = {}
             for prim in get_stage().Traverse():
                 prim_path = prim.GetPath().pathString
                 if not any(
@@ -1302,49 +1499,83 @@ class RandomizedWarehouseBuilder:
                     for search_root in search_roots
                 ):
                     continue
+                if self._path_matches_any_subtree(prim_path, exclude_paths):
+                    stats["skipped_excluded_subtree_count"] += 1
+                    continue
                 if not prim or not prim.IsValid() or not prim.IsActive():
                     continue
                 if not prim.IsA(UsdGeom.Gprim):
                     continue
                 if require_collision_api and (UsdPhysics is None or not prim.HasAPI(UsdPhysics.CollisionAPI)):
                     continue
-
-                prim_path_lower = prim_path.lower()
-                if any(token in prim_path_lower for token in ignored_tokens):
+                if self._is_ignored_obstacle_path(prim_path):
+                    stats["skipped_ignored_path_count"] += 1
                     continue
-                debug_payload[gprim_key] = int(debug_payload.get(gprim_key, 0)) + 1
 
-                root_path = self._canonicalize_prim_path(prim_path, root_mode="nearest_xform")
-                root_bbox = _root_bbox_for_map(root_path)
-                if root_bbox is None:
+                stats[gprim_key] = int(stats.get(gprim_key, 0)) + 1
+                world_bound = bbox_cache.ComputeWorldBound(prim)
+                aligned = world_bound.ComputeAlignedBox()
+                bbox_min = np.array([float(value) for value in aligned.GetMin()], dtype=float)
+                bbox_max = np.array([float(value) for value in aligned.GetMax()], dtype=float)
+                if not (np.all(np.isfinite(bbox_min)) and np.all(np.isfinite(bbox_max))):
+                    stats["skipped_invalid_bbox_count"] += 1
                     continue
-                bbox_min, bbox_max = root_bbox
-                if _append_bbox(bbox_min, bbox_max, source_key=root_key):
-                    accepted += 1
-            return accepted
+                if not self._bbox_intersects_occupancy_z_range(
+                    bbox_min,
+                    bbox_max,
+                    occupancy_z_range_m=occupancy_z_range_m,
+                ):
+                    stats["skipped_elevated_gprim_count"] += 1
+                    continue
 
-        collision_count = _collect_stage_bboxes(
+                root_path = self._canonicalize_obstacle_root_path(
+                    prim_path,
+                    max_planar_area_m2=max_planar_area_m2,
+                )
+                if self._path_matches_any_subtree(root_path, exclude_paths):
+                    stats["skipped_excluded_subtree_count"] += 1
+                    continue
+                if self._is_ignored_obstacle_path(root_path):
+                    continue
+                if root_path in roots:
+                    continue
+                try:
+                    root_bbox_min, root_bbox_max = compute_world_bbox(root_path)
+                except Exception:
+                    stats["skipped_invalid_bbox_count"] += 1
+                    continue
+                if not self._bbox_is_valid_obstacle_root(
+                    root_bbox_min,
+                    root_bbox_max,
+                    max_planar_area_m2=max_planar_area_m2,
+                ):
+                    stats["skipped_large_root_count"] += 1
+                    continue
+                if not self._bbox_intersects_occupancy_z_range(
+                    np.asarray(root_bbox_min, dtype=float),
+                    np.asarray(root_bbox_max, dtype=float),
+                    occupancy_z_range_m=occupancy_z_range_m,
+                ):
+                    continue
+                roots[root_path] = (
+                    np.array(root_bbox_min, dtype=float),
+                    np.array(root_bbox_max, dtype=float),
+                )
+                stats[root_key] = int(stats.get(root_key, 0)) + 1
+            return roots
+
+        roots = _collect(
             require_collision_api=True,
-            gprim_key="collision_gprim_count",
+            gprim_key="collision_gprim_considered_count",
             root_key="collision_root_count",
         )
-        if collision_count <= 0:
-            _collect_stage_bboxes(
+        if not roots:
+            roots = _collect(
                 require_collision_api=False,
-                gprim_key="fallback_render_gprim_count",
+                gprim_key="fallback_render_gprim_considered_count",
                 root_key="fallback_render_root_count",
             )
-
-        for accepted in self._accepted_layout_bboxes:
-            _append_bbox(
-                np.array(accepted["bbox_min"], dtype=float),
-                np.array(accepted["bbox_max"], dtype=float),
-                source_key="accepted_layout_bbox_count",
-            )
-
-        debug_payload["obstacle_bbox_count"] = len(obstacle_bboxes)
-        debug_payload["environment_bbox"] = self._environment_bbox_dict()
-        return obstacle_bboxes, debug_payload
+        return roots, stats
 
     def _sample_rollouts(self) -> None:
         occupancy_map = OccupancyMap.load(str(self._nav2_map_path))
@@ -1438,7 +1669,6 @@ class RandomizedWarehouseBuilder:
     def _write_failure_snapshot(self, *, current_step: str, exception: Exception) -> None:
         try:
             self._bundle_dir.mkdir(parents=True, exist_ok=True)
-            map_export_mode = getattr(self, "_map_export_mode", "bbox")
             payload = {
                 "scene_id": self._scene_id,
                 "seed": int(self._seed),
@@ -1449,7 +1679,6 @@ class RandomizedWarehouseBuilder:
                 "template": {
                     "template_id": self._template.template_id,
                     "variant_id": self._template.variant_id,
-                    "map_export_mode": map_export_mode,
                     "description": self._template.description,
                     "template_definition_path": str(self._template.template_config_path),
                     "shared_defaults_config_path": str(self._template.shared_defaults_config_path),
@@ -1503,13 +1732,11 @@ class RandomizedWarehouseBuilder:
         }
 
     def _build_validation_summary(self) -> dict[str, Any]:
-        map_export_mode = getattr(self, "_map_export_mode", "bbox")
         return {
             "scene_id": self._scene_id,
             "seed": int(self._seed),
             "template_id": self._template.template_id,
             "variant_id": self._template.variant_id,
-            "map_export_mode": map_export_mode,
             "randomized_object_count": len(self._randomization_records),
             "accepted_layout_boxes": len(self._accepted_layout_bboxes),
             "resolved_object_groups": dict(self._resolved_group_details),
@@ -1526,12 +1753,10 @@ class RandomizedWarehouseBuilder:
 
     def _build_team_config_payload(self) -> dict[str, Any]:
         first_robot_model = self._robot_adapters[0].model_id if self._robot_adapters else ""
-        map_export_mode = getattr(self, "_map_export_mode", "bbox")
         return {
             "scene_id": self._scene_id,
             "template_id": self._template.template_id,
             "variant_id": self._template.variant_id,
-            "map_export_mode": map_export_mode,
             "template_definition_path": str(self._template.template_config_path),
             "shared_defaults_config_path": str(self._template.shared_defaults_config_path),
             "preset_config_path": (
@@ -1555,14 +1780,12 @@ class RandomizedWarehouseBuilder:
         }
 
     def _build_manifest_payload(self) -> dict[str, Any]:
-        map_export_mode = getattr(self, "_map_export_mode", "bbox")
         return {
             "scene_id": self._scene_id,
             "seed": int(self._seed),
             "template": {
                 "template_id": self._template.template_id,
                 "variant_id": self._template.variant_id,
-                "map_export_mode": map_export_mode,
                 "description": self._template.description,
                 "template_definition_path": str(self._template.template_config_path),
                 "shared_defaults_config_path": str(self._template.shared_defaults_config_path),
@@ -1684,7 +1907,38 @@ class RandomizedWarehouseBuilder:
                 or bbox_max[1] < existing_min[1] - expanded_margin
                 or bbox_min[1] > existing_max[1] + expanded_margin
                 or bbox_max[2] < existing_min[2] - expanded_margin
-                or bbox_min[2] > existing_max[2] + expanded_margin
+                    or bbox_min[2] > existing_max[2] + expanded_margin
+                ):
+                    return True
+        return False
+
+    def _bbox_intersects_environment_obstacles(
+        self,
+        prim_path: str,
+        bbox_min: np.ndarray,
+        bbox_max: np.ndarray,
+        *,
+        margin_m: float = 0.0,
+    ) -> bool:
+        candidate_root_path = self._canonicalize_obstacle_root_path(
+            prim_path,
+            max_planar_area_m2=self._obstacle_root_area_limit_m2(),
+        )
+        obstacle_roots, _ = self._collect_environment_obstacle_root_bboxes(
+            occupancy_z_range_m=None,
+            exclude_root_paths={candidate_root_path, prim_path},
+        )
+        for obstacle_root_path, (obstacle_min, obstacle_max) in obstacle_roots.items():
+            if obstacle_root_path == candidate_root_path:
+                continue
+            expanded_margin = float(margin_m)
+            if not (
+                bbox_max[0] < obstacle_min[0] - expanded_margin
+                or bbox_min[0] > obstacle_max[0] + expanded_margin
+                or bbox_max[1] < obstacle_min[1] - expanded_margin
+                or bbox_min[1] > obstacle_max[1] + expanded_margin
+                or bbox_max[2] < obstacle_min[2] - expanded_margin
+                or bbox_min[2] > obstacle_max[2] + expanded_margin
             ):
                 return True
         return False
@@ -1731,6 +1985,15 @@ class RandomizedWarehouseBuilder:
     def _validate_final_layout(self) -> None:
         for accepted in self._accepted_layout_bboxes:
             bbox_min, bbox_max = compute_world_bbox(accepted["prim_path"])
+            if self._bbox_intersects_environment_obstacles(
+                accepted["prim_path"],
+                bbox_min,
+                bbox_max,
+                margin_m=float(accepted.get("margin_m", 0.0)),
+            ):
+                raise RuntimeError(
+                    f"Final environment-overlap validation failed for {accepted['prim_path']} after randomization."
+                )
             if not self._physx_overlap_clear(
                 accepted["prim_path"],
                 bbox_min,
@@ -1875,6 +2138,7 @@ class RandomizedWarehouseBuilder:
             origin_hint_xyz=origin_hint_xyz,
             min_bound_xyz=min_bound_xyz,
             max_bound_xyz=max_bound_xyz,
+            occupancy_z_range_m=map_spec.occupancy_z_range_m,
         )
 
     def _environment_bbox_is_usable(self, map_spec: TemplateMapSpec) -> bool:

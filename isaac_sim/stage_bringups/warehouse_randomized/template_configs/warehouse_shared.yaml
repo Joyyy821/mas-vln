@@ -14,12 +14,14 @@ nav2_map:
   origin_hint_xyz: [-11.975, -17.975, 0.0]
   min_bound_xyz: [-11.975, -17.975, 0.1]
   max_bound_xyz: [11.975, 20.825, 2.0]
+  occupancy_z_range_m: [0.1, 0.62]
 
 mapf_map:
   resolution_m: 0.2
   origin_hint_xyz: [-11.975, -17.975, 0.0]
   min_bound_xyz: [-11.975, -17.975, 0.1]
   max_bound_xyz: [12.025, 20.825, 2.0]
+  occupancy_z_range_m: [0.1, 0.62]
 
 focus_group_names: [focus_objects]
 focus_distance_range_m: [2.5, 5.25]
@@ -117,6 +119,22 @@ object_groups:
     selectors:
       - mode: regex
         value: (?i)(shelf|rack)
+  - group_id: map_structure
+    required: false
+    root_mode: nearest_xform
+    selectors:
+      - mode: regex
+        value: (?i)SM_WallA_(?:3M|6M)
+      - mode: regex
+        value: (?i)SM_RackFrame
+      - mode: regex
+        value: (?i)SM_RackShelf
+  - group_id: map_props
+    required: false
+    root_mode: nearest_xform
+    selectors:
+      - mode: regex
+        value: (?i)SM_Pushcart
   - group_id: shelf_props
     required: false
     root_mode: nearest_xform

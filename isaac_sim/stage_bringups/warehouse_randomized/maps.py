@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -33,57 +33,84 @@ class MapExportResult:
     occupied_cells: int
     free_cells: int
     unknown_cells: int
+    debug: dict[str, Any] = field(default_factory=dict)
 
 
 def _dim_xy(dims: Any) -> tuple[int, int]:
-    width = int(getattr(dims, "x", dims[0]))
-    height = int(getattr(dims, "y", dims[1]))
+    if hasattr(dims, "x") and hasattr(dims, "y"):
+        width = int(dims.x)
+        height = int(dims.y)
+    else:
+        width = int(dims[0])
+        height = int(dims[1])
     return width, height
 
 
-def _expected_dim_xy(
+def _compute_world_xy_bounds(
+    env_prim_path: str,
     *,
-    resolution_m: float,
-    min_bound_xyz: Sequence[float],
-    max_bound_xyz: Sequence[float],
-) -> tuple[int, int]:
-    width = int(round((float(max_bound_xyz[0]) - float(min_bound_xyz[0])) / float(resolution_m)))
-    height = int(round((float(max_bound_xyz[1]) - float(min_bound_xyz[1])) / float(resolution_m)))
-    return max(width, 1), max(height, 1)
+    z_min: float = 0.1,
+    z_max: float = 0.62,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    import omni.usd
+    from pxr import Usd, UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(env_prim_path)
+    if not prim or not prim.IsValid():
+        raise RuntimeError(f"Prim not found for occupancy-map bounds: {env_prim_path}")
+
+    bbox_cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+        useExtentsHint=True,
+    )
+    aligned_bbox = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
+    min_pt = aligned_bbox.GetMin()
+    max_pt = aligned_bbox.GetMax()
+    min_bound_xyz = (float(min_pt[0]), float(min_pt[1]), float(z_min))
+    max_bound_xyz = (float(max_pt[0]), float(max_pt[1]), float(z_max))
+
+    if min_bound_xyz[0] >= max_bound_xyz[0] or min_bound_xyz[1] >= max_bound_xyz[1]:
+        raise RuntimeError(
+            "Occupancy-map environment bounds are invalid: "
+            f"min={min_bound_xyz}, max={max_bound_xyz}"
+        )
+    if float(z_min) >= float(z_max):
+        raise RuntimeError(f"Occupancy-map z bounds are invalid: z_min={z_min}, z_max={z_max}")
+
+    return min_bound_xyz, max_bound_xyz
 
 
 def _reshape_generator_buffer(
     raw_buffer_flat: np.ndarray,
     *,
     dims: Any,
-    expected_width_px: int,
-    expected_height_px: int,
 ) -> tuple[np.ndarray, int, int]:
-    dim_width_px, dim_height_px = _dim_xy(dims)
+    width_px, height_px = _dim_xy(dims)
+    if width_px <= 0 or height_px <= 0:
+        raise RuntimeError(
+            "Occupancy-map generator returned invalid dimensions: "
+            f"width={width_px}, height={height_px}, dims={dims}"
+        )
+
     cell_count = int(raw_buffer_flat.size)
-    expected_cell_count = int(expected_width_px * expected_height_px)
+    expected_cell_count = int(width_px * height_px)
     if cell_count <= 0:
         raise RuntimeError("Occupancy-map generator returned an empty buffer.")
 
     if cell_count == expected_cell_count:
-        if dim_width_px == expected_width_px and dim_height_px == expected_height_px:
-            return raw_buffer_flat.reshape((expected_height_px, expected_width_px)), expected_width_px, expected_height_px
-        if dim_width_px == expected_height_px and dim_height_px == expected_width_px:
-            return (
-                raw_buffer_flat.reshape((dim_height_px, dim_width_px)).T,
-                expected_width_px,
-                expected_height_px,
-            )
-        return raw_buffer_flat.reshape((expected_height_px, expected_width_px)), expected_width_px, expected_height_px
-
-    if dim_width_px > 0 and dim_height_px > 0 and cell_count == dim_width_px * dim_height_px:
-        return raw_buffer_flat.reshape((dim_height_px, dim_width_px)), dim_width_px, dim_height_px
+        return raw_buffer_flat.reshape((height_px, width_px)), width_px, height_px
 
     raise RuntimeError(
         "Occupancy-map generator returned inconsistent dimensions: "
-        f"buffer cells={cell_count}, generator dims=({dim_width_px}, {dim_height_px}), "
-        f"expected dims=({expected_width_px}, {expected_height_px})."
+        f"buffer cells={cell_count}, generator dims=({width_px}, {height_px})."
     )
+
+
+def _pixel_histogram(image_buffer: np.ndarray) -> dict[int, int]:
+    values, counts = np.unique(np.asarray(image_buffer, dtype=np.uint8), return_counts=True)
+    return {int(value): int(count) for value, count in zip(values, counts)}
 
 
 def _write_map_artifacts(
@@ -94,6 +121,7 @@ def _write_map_artifacts(
     min_bound_xyz: Sequence[float],
     max_bound_xyz: Sequence[float],
     image_buffer: np.ndarray,
+    debug_payload: dict[str, Any] | None = None,
 ) -> MapExportResult:
     yaml_path = Path(yaml_path).expanduser().resolve()
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +140,10 @@ def _write_map_artifacts(
     }
     with yaml_path.open("w", encoding="utf-8") as stream:
         yaml.safe_dump(payload, stream, sort_keys=False)
+    if not png_path.exists():
+        raise RuntimeError(f"Occupancy-map image was not written: {png_path}")
+    if not yaml_path.exists():
+        raise RuntimeError(f"Occupancy-map YAML was not written: {yaml_path}")
 
     occupied_cells = int(np.count_nonzero(image_buffer == DEFAULT_OCCUPIED_PIXEL))
     free_cells = int(np.count_nonzero(image_buffer == DEFAULT_FREE_PIXEL))
@@ -130,122 +162,186 @@ def _write_map_artifacts(
         occupied_cells=occupied_cells,
         free_cells=free_cells,
         unknown_cells=unknown_cells,
+        debug={
+            **(debug_payload or {}),
+            "yaml_path": str(yaml_path),
+            "png_path": str(png_path),
+            "image_pixel_histogram": _pixel_histogram(image_buffer),
+        },
     )
 
 
-def export_occupancy_map(
+def _export_occupancy_map(
     *,
+    env_prim_path: str,
     yaml_path: str | Path,
     resolution_m: float,
-    origin_hint_xyz: Sequence[float],
-    min_bound_xyz: Sequence[float],
-    max_bound_xyz: Sequence[float],
-    start_location_xyz: Sequence[float] | None = None,
+    origin_xyz: Sequence[float] = (0.0, 0.0, 0.0),
+    z_min: float = 0.1,
+    z_max: float = 0.62,
+    rotate_180: bool = True,
 ) -> MapExportResult:
     import omni.physx
     import omni.usd
     from isaacsim.asset.gen.omap.bindings import _omap
 
-    physx = omni.physx.acquire_physx_interface()
+    get_physx_interface = getattr(omni.physx, "get_physx_interface", None)
+    acquire_physx_interface = getattr(omni.physx, "acquire_physx_interface", None)
+    if callable(get_physx_interface):
+        physx = get_physx_interface()
+    elif callable(acquire_physx_interface):
+        physx = acquire_physx_interface()
+    else:
+        raise RuntimeError("Unable to acquire Isaac Sim PhysX interface for occupancy map export.")
+
+    min_bound_xyz, max_bound_xyz = _compute_world_xy_bounds(
+        env_prim_path,
+        z_min=z_min,
+        z_max=z_max,
+    )
+
     stage_id = omni.usd.get_context().get_stage_id()
     generator = _omap.Generator(physx, stage_id)
-    generator.update_settings(float(resolution_m), 4, 5, 6)
-    if start_location_xyz is None:
-        start_location_xyz = (
-            0.5 * (float(min_bound_xyz[0]) + float(max_bound_xyz[0])),
-            0.5 * (float(min_bound_xyz[1]) + float(max_bound_xyz[1])),
-            max(0.2, float(min_bound_xyz[2])),
-        )
+    generator.update_settings(float(resolution_m), DEFAULT_OCCUPIED_PIXEL, 254, DEFAULT_UNKNOWN_PIXEL)
     generator.set_transform(
-        tuple(float(value) for value in start_location_xyz[:3]),
+        tuple(float(value) for value in origin_xyz[:3]),
         tuple(float(value) for value in min_bound_xyz[:3]),
         tuple(float(value) for value in max_bound_xyz[:3]),
     )
     generator.generate2d()
 
     dims = generator.get_dimensions()
-    expected_width_px, expected_height_px = _expected_dim_xy(
-        resolution_m=resolution_m,
-        min_bound_xyz=min_bound_xyz,
-        max_bound_xyz=max_bound_xyz,
-    )
-    raw_buffer_flat = np.asarray(generator.get_buffer(), dtype=np.int32)
+    raw_buffer_flat = np.asarray(generator.get_buffer(), dtype=np.uint8)
     raw_buffer, width_px, height_px = _reshape_generator_buffer(
         raw_buffer_flat,
         dims=dims,
-        expected_width_px=expected_width_px,
-        expected_height_px=expected_height_px,
     )
 
+    raw_buffer = np.asarray(raw_buffer, dtype=np.uint8)
+    rotated_buffer = np.rot90(raw_buffer, 2) if rotate_180 else raw_buffer
     image_buffer = np.full((height_px, width_px), DEFAULT_UNKNOWN_PIXEL, dtype=np.uint8)
-    image_buffer[raw_buffer == 4] = DEFAULT_OCCUPIED_PIXEL
-    image_buffer[raw_buffer == 5] = DEFAULT_FREE_PIXEL
-    image_buffer[raw_buffer == 6] = DEFAULT_UNKNOWN_PIXEL
-    # ROS occupancy-map YAML uses a lower-left origin, while image rows are top-first.
-    return _write_map_artifacts(
-        yaml_path=yaml_path,
-        resolution_m=resolution_m,
-        origin_hint_xyz=origin_hint_xyz,
-        min_bound_xyz=min_bound_xyz,
-        max_bound_xyz=max_bound_xyz,
-        image_buffer=np.flipud(image_buffer),
-    )
+    image_buffer[rotated_buffer == DEFAULT_OCCUPIED_PIXEL] = DEFAULT_OCCUPIED_PIXEL
+    image_buffer[rotated_buffer == 254] = DEFAULT_FREE_PIXEL
 
-
-def export_bbox_occupancy_map(
-    *,
-    yaml_path: str | Path,
-    resolution_m: float,
-    origin_hint_xyz: Sequence[float],
-    min_bound_xyz: Sequence[float],
-    max_bound_xyz: Sequence[float],
-    obstacle_bboxes: Sequence[tuple[Sequence[float], Sequence[float]]],
-) -> MapExportResult:
-    width_px, height_px = _expected_dim_xy(
-        resolution_m=resolution_m,
-        min_bound_xyz=min_bound_xyz,
-        max_bound_xyz=max_bound_xyz,
-    )
-    image_buffer = np.full((height_px, width_px), DEFAULT_FREE_PIXEL, dtype=np.uint8)
-
-    origin_x = float(origin_hint_xyz[0])
-    origin_y = float(origin_hint_xyz[1])
-    max_x = float(origin_hint_xyz[0]) + width_px * float(resolution_m)
-    max_y = float(origin_hint_xyz[1]) + height_px * float(resolution_m)
-
-    for bbox_min_xyz, bbox_max_xyz in obstacle_bboxes:
-        min_x = max(float(bbox_min_xyz[0]), origin_x)
-        min_y = max(float(bbox_min_xyz[1]), origin_y)
-        max_x_bbox = min(float(bbox_max_xyz[0]), max_x)
-        max_y_bbox = min(float(bbox_max_xyz[1]), max_y)
-        if max_x_bbox <= min_x or max_y_bbox <= min_y:
-            continue
-
-        col_min = int(np.floor((min_x - origin_x) / float(resolution_m)))
-        col_max = int(np.ceil((max_x_bbox - origin_x) / float(resolution_m))) - 1
-        row_bottom_min = int(np.floor((min_y - origin_y) / float(resolution_m)))
-        row_bottom_max = int(np.ceil((max_y_bbox - origin_y) / float(resolution_m))) - 1
-        if col_max < 0 or row_bottom_max < 0 or col_min >= width_px or row_bottom_min >= height_px:
-            continue
-
-        col_min = max(0, col_min)
-        col_max = min(width_px - 1, col_max)
-        row_bottom_min = max(0, row_bottom_min)
-        row_bottom_max = min(height_px - 1, row_bottom_max)
-        if col_min > col_max or row_bottom_min > row_bottom_max:
-            continue
-
-        row_min = height_px - 1 - row_bottom_max
-        row_max = height_px - 1 - row_bottom_min
-        image_buffer[row_min : row_max + 1, col_min : col_max + 1] = DEFAULT_OCCUPIED_PIXEL
+    occupied_cells = int(np.count_nonzero(image_buffer == DEFAULT_OCCUPIED_PIXEL))
+    free_cells = int(np.count_nonzero(image_buffer == DEFAULT_FREE_PIXEL))
+    if occupied_cells <= 0 or free_cells <= 0:
+        raise RuntimeError(
+            "Occupancy-map generator output is not meaningful: "
+            f"occupied_cells={occupied_cells}, free_cells={free_cells}, "
+            f"dims=({width_px}, {height_px}), raw_histogram={_pixel_histogram(raw_buffer)}"
+        )
 
     return _write_map_artifacts(
         yaml_path=yaml_path,
         resolution_m=resolution_m,
-        origin_hint_xyz=origin_hint_xyz,
+        origin_hint_xyz=(float(min_bound_xyz[0]), float(min_bound_xyz[1]), 0.0),
         min_bound_xyz=min_bound_xyz,
         max_bound_xyz=max_bound_xyz,
         image_buffer=image_buffer,
+        debug_payload={
+            "env_prim_path": str(env_prim_path),
+            "resolution_m": float(resolution_m),
+            "omap_origin_xyz": [float(value) for value in origin_xyz[:3]],
+            "min_bound_xyz": [float(value) for value in min_bound_xyz],
+            "max_bound_xyz": [float(value) for value in max_bound_xyz],
+            "z_min": float(z_min),
+            "z_max": float(z_max),
+            "rotate_180": bool(rotate_180),
+            "generator_dimensions": [int(width_px), int(height_px)],
+            "generator_buffer_size": int(raw_buffer_flat.size),
+            "raw_pixel_histogram": _pixel_histogram(raw_buffer),
+        },
+    )
+
+
+def _export_resampled_occupancy_map(
+    *,
+    yaml_path: str | Path,
+    source_result: MapExportResult,
+    resolution_m: float,
+) -> MapExportResult:
+    if float(resolution_m) <= 0.0:
+        raise RuntimeError(f"Invalid resampled occupancy-map resolution: {resolution_m}")
+    if float(source_result.resolution_m) <= 0.0:
+        raise RuntimeError(f"Invalid source occupancy-map resolution: {source_result.resolution_m}")
+
+    source_image = np.asarray(Image.open(source_result.png_path).convert("L"), dtype=np.uint8)
+    source_height_px, source_width_px = source_image.shape[:2]
+    source_origin_x = float(source_result.origin_xyz[0])
+    source_origin_y = float(source_result.origin_xyz[1])
+    source_resolution = float(source_result.resolution_m)
+    target_resolution = float(resolution_m)
+    min_bound_xyz = tuple(float(value) for value in source_result.min_bound_xyz)
+    max_bound_xyz = tuple(float(value) for value in source_result.max_bound_xyz)
+
+    target_width_px = max(
+        1,
+        int(round((float(max_bound_xyz[0]) - float(min_bound_xyz[0])) / target_resolution)),
+    )
+    target_height_px = max(
+        1,
+        int(round((float(max_bound_xyz[1]) - float(min_bound_xyz[1])) / target_resolution)),
+    )
+    target_image = np.full((target_height_px, target_width_px), DEFAULT_UNKNOWN_PIXEL, dtype=np.uint8)
+
+    for target_row in range(target_height_px):
+        bottom_index = target_height_px - 1 - target_row
+        y_min = source_origin_y + bottom_index * target_resolution
+        y_max = y_min + target_resolution
+        source_row_min = source_height_px - int(np.ceil((y_max - source_origin_y) / source_resolution))
+        source_row_max = source_height_px - int(np.floor((y_min - source_origin_y) / source_resolution))
+        source_row_min = max(0, min(source_height_px, source_row_min))
+        source_row_max = max(0, min(source_height_px, source_row_max))
+        if source_row_min >= source_row_max:
+            continue
+
+        for target_col in range(target_width_px):
+            x_min = source_origin_x + target_col * target_resolution
+            x_max = x_min + target_resolution
+            source_col_min = int(np.floor((x_min - source_origin_x) / source_resolution))
+            source_col_max = int(np.ceil((x_max - source_origin_x) / source_resolution))
+            source_col_min = max(0, min(source_width_px, source_col_min))
+            source_col_max = max(0, min(source_width_px, source_col_max))
+            if source_col_min >= source_col_max:
+                continue
+
+            source_block = source_image[source_row_min:source_row_max, source_col_min:source_col_max]
+            if np.any(source_block == DEFAULT_OCCUPIED_PIXEL):
+                target_image[target_row, target_col] = DEFAULT_OCCUPIED_PIXEL
+            elif np.any(source_block == DEFAULT_UNKNOWN_PIXEL):
+                target_image[target_row, target_col] = DEFAULT_UNKNOWN_PIXEL
+            else:
+                target_image[target_row, target_col] = DEFAULT_FREE_PIXEL
+
+    occupied_cells = int(np.count_nonzero(target_image == DEFAULT_OCCUPIED_PIXEL))
+    free_cells = int(np.count_nonzero(target_image == DEFAULT_FREE_PIXEL))
+    if occupied_cells <= 0 or free_cells <= 0:
+        raise RuntimeError(
+            "Resampled occupancy-map output is not meaningful: "
+            f"occupied_cells={occupied_cells}, free_cells={free_cells}, "
+            f"dims=({target_width_px}, {target_height_px}), source_histogram={_pixel_histogram(source_image)}"
+        )
+
+    return _write_map_artifacts(
+        yaml_path=yaml_path,
+        resolution_m=target_resolution,
+        origin_hint_xyz=source_result.origin_xyz,
+        min_bound_xyz=min_bound_xyz,
+        max_bound_xyz=max_bound_xyz,
+        image_buffer=target_image,
+        debug_payload={
+            "source_yaml_path": str(source_result.yaml_path),
+            "source_png_path": str(source_result.png_path),
+            "source_resolution_m": float(source_result.resolution_m),
+            "source_dimensions": [int(source_width_px), int(source_height_px)],
+            "source_pixel_histogram": _pixel_histogram(source_image),
+            "resample_policy": "occupied_over_unknown_over_free",
+            "target_resolution_m": target_resolution,
+            "target_dimensions": [int(target_width_px), int(target_height_px)],
+            "min_bound_xyz": [float(value) for value in min_bound_xyz],
+            "max_bound_xyz": [float(value) for value in max_bound_xyz],
+        },
     )
 
 
