@@ -3,6 +3,9 @@ install
 log
 __pycache__
 *.pyc
-experiments/
+experiments/*
+!experiments/randomized_warehouse/
+experiments/randomized_warehouse/*
+!experiments/randomized_warehouse/collection_metadata.yaml
 isaac_sim/vlm-caption-data/
 .codex

@@ -456,6 +456,7 @@ def sample_multi_robot_rollouts(
     min_goal_distance_m: float,
     focus_xy: Sequence[float] | None = None,
     focus_distance_range_m: tuple[float, float] = (2.5, 5.5),
+    min_initial_focus_distance_m: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     navigation_mask = build_navigation_free_mask(
         occupancy_map,
@@ -465,34 +466,57 @@ def sample_multi_robot_rollouts(
         raise RuntimeError("No connected free space remains after occupancy inflation.")
 
     focus_candidate_mask = navigation_mask.copy()
+    initial_candidate_mask = navigation_mask.copy()
     focus_xy_np = None if focus_xy is None else np.asarray(focus_xy[:2], dtype=float)
+    goal_candidate_count = int(np.count_nonzero(focus_candidate_mask))
+    initial_candidate_count = int(np.count_nonzero(initial_candidate_mask))
+    resolved_min_initial_focus_distance_m = None
     if focus_xy_np is not None:
-        goal_rows, goal_cols = np.nonzero(navigation_mask)
-        goal_xy = occupancy_map.grid_to_world_xy(goal_rows, goal_cols)
-        distances = np.linalg.norm(goal_xy - focus_xy_np, axis=1)
+        candidate_rows, candidate_cols = np.nonzero(navigation_mask)
+        candidate_xy = occupancy_map.grid_to_world_xy(candidate_rows, candidate_cols)
+        distances = np.linalg.norm(candidate_xy - focus_xy_np, axis=1)
         focus_candidate_mask = np.zeros_like(navigation_mask, dtype=bool)
         valid = (
             distances >= float(focus_distance_range_m[0])
         ) & (
             distances <= float(focus_distance_range_m[1])
         )
-        focus_candidate_mask[goal_rows[valid], goal_cols[valid]] = True
+        focus_candidate_mask[candidate_rows[valid], candidate_cols[valid]] = True
         if not np.any(focus_candidate_mask):
-            focus_candidate_mask = navigation_mask.copy()
+            raise RuntimeError(
+                "No goal-pose candidates remain inside the focus-distance range after "
+                "occupancy inflation."
+            )
+        goal_candidate_count = int(np.count_nonzero(focus_candidate_mask))
+
+        if min_initial_focus_distance_m is None:
+            resolved_min_initial_focus_distance_m = float(focus_distance_range_m[1]) + 1.5
+        else:
+            resolved_min_initial_focus_distance_m = float(min_initial_focus_distance_m)
+        initial_candidate_mask = np.zeros_like(navigation_mask, dtype=bool)
+        initial_valid = distances >= resolved_min_initial_focus_distance_m
+        initial_candidate_mask[candidate_rows[initial_valid], candidate_cols[initial_valid]] = True
+        initial_candidate_count = int(np.count_nonzero(initial_candidate_mask))
+        if not np.any(initial_candidate_mask):
+            raise RuntimeError(
+                "No initial-pose candidates remain after excluding the focus/goal area."
+            )
 
     rollouts: list[dict[str, Any]] = []
     robot_names = [str(name) for name in robot_names]
+    observed_initial_focus_distances: list[float] = []
+    observed_initial_goal_distances: list[float] = []
     for rollout_index in range(int(rollout_count)):
         initial_indices = _greedy_sample_indices(
             occupancy_map,
-            navigation_mask,
+            initial_candidate_mask,
             count=len(robot_names),
             rng=rng,
             min_separation_m=float(min_pairwise_distance_m),
         )
         if len(initial_indices) != len(robot_names):
             raise RuntimeError(
-                "Unable to sample enough collision-free initial poses for the requested robot count."
+                "Unable to sample enough collision-free initial poses outside the focus/goal area."
             )
 
         initial_xy = [
@@ -528,6 +552,13 @@ def sample_multi_robot_rollouts(
         ):
             init_xy = occupancy_map.cell_center_world_xy(init_row, init_col)
             goal_xy = occupancy_map.cell_center_world_xy(goal_row, goal_col)
+            if focus_xy_np is not None:
+                observed_initial_focus_distances.append(
+                    float(np.linalg.norm(np.asarray(init_xy, dtype=float) - focus_xy_np))
+                )
+            observed_initial_goal_distances.append(
+                float(np.linalg.norm(np.asarray(init_xy, dtype=float) - np.asarray(goal_xy, dtype=float)))
+            )
             initial_yaw = float(rng.uniform(-np.pi, np.pi))
             if focus_xy_np is not None:
                 goal_yaw = float(np.arctan2(focus_xy_np[1] - goal_xy[1], focus_xy_np[0] - goal_xy[0]))
@@ -547,6 +578,23 @@ def sample_multi_robot_rollouts(
     validation = {
         "inflation_radius_m": float(inflation_radius_m),
         "largest_component_free_cells": int(np.count_nonzero(navigation_mask)),
+        "initial_pose_candidates": int(initial_candidate_count),
         "focus_goal_candidates": int(np.count_nonzero(focus_candidate_mask)),
+        "goal_pose_candidates": int(goal_candidate_count),
+        "selected_focus_xy": None if focus_xy_np is None else focus_xy_np.tolist(),
+        "min_initial_focus_distance_m": (
+            None if resolved_min_initial_focus_distance_m is None else float(resolved_min_initial_focus_distance_m)
+        ),
+        "observed_min_initial_focus_distance_m": (
+            None
+            if not observed_initial_focus_distances
+            else float(min(observed_initial_focus_distances))
+        ),
+        "min_initial_goal_distance_m": float(min_goal_distance_m),
+        "observed_min_initial_goal_distance_m": (
+            None
+            if not observed_initial_goal_distances
+            else float(min(observed_initial_goal_distances))
+        ),
     }
     return rollouts, validation

@@ -123,14 +123,35 @@ def flatten_pose_arrays(robots: list[dict[str, Any]], pose_key: str) -> list[flo
     ]
 
 
-def resolve_optional_path(path_value: str | None, base_dir: str | None) -> str | None:
+def resolve_optional_path(
+    path_value: str | None,
+    base_dir: str | None,
+    config_dir: str | None = None,
+) -> str | None:
     if not path_value:
         return None
+
+    path_value = os.path.expanduser(str(path_value))
     if os.path.isabs(path_value):
+        if os.path.exists(path_value):
+            return path_value
+        if config_dir is not None:
+            colocated_path = os.path.normpath(
+                os.path.join(config_dir, os.path.basename(path_value))
+            )
+            if os.path.exists(colocated_path):
+                return colocated_path
         return path_value
-    if base_dir is None:
-        return path_value
-    return os.path.normpath(os.path.join(base_dir, path_value))
+
+    candidate_dirs = [path for path in (config_dir, base_dir) if path]
+    for candidate_dir in candidate_dirs:
+        candidate_path = os.path.normpath(os.path.join(candidate_dir, path_value))
+        if os.path.exists(candidate_path):
+            return candidate_path
+
+    if candidate_dirs:
+        return os.path.normpath(os.path.join(candidate_dirs[0], path_value))
+    return path_value
 
 
 def _normalize_robots_config(robots_config: Any, source_label: str) -> list[dict[str, Any]]:
@@ -201,8 +222,17 @@ def load_multi_rollout_config(team_config_path: str, maps_dir: str | None = None
     config = load_yaml_file(team_config_path) or {}
 
     environment = config.get("environment", {})
-    nav2_map = resolve_optional_path(environment.get("nav2_map"), maps_dir)
-    mapf_map = resolve_optional_path(environment.get("mapf_map"), maps_dir)
+    team_config_dir = os.path.dirname(os.path.abspath(os.path.expanduser(team_config_path)))
+    nav2_map = resolve_optional_path(
+        environment.get("nav2_map"),
+        maps_dir,
+        config_dir=team_config_dir,
+    )
+    mapf_map = resolve_optional_path(
+        environment.get("mapf_map"),
+        maps_dir,
+        config_dir=team_config_dir,
+    )
 
     language_instruction = str(config.get("language_instruction", "") or "").strip()
     raw_rollouts = config.get("rollouts")

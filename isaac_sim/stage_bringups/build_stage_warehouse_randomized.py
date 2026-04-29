@@ -22,7 +22,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from isaac_sim.stage_bringups.warehouse_randomized.templates import (  # noqa: E402
     DEFAULT_BASE_VARIANT_ID,
-    DEFAULT_RANDOMIZATION_VARIANT_IDS,
     DEFAULT_VARIANT_IDS,
     WarehouseTemplate,
     compose_warehouse_template,
@@ -33,7 +32,12 @@ from isaac_sim.stage_bringups.warehouse_randomized.templates import (  # noqa: E
 
 
 DEFAULT_SCENE_ROOT_DIR = REPO_ROOT / "experiments" / "randomized_warehouse"
-DEFAULT_REFERENCE_CONFIG = REPO_ROOT / "data_configs" / "warehouse" / "warehouse_forklift.yaml"
+DEFAULT_COLLECTION_LANGUAGE_INSTRUCTION = "go to the forklift near the shelf"
+DEFAULT_FOCUS_SELECTOR_ID = "forklift_near_shelf_min_world_x"
+DEFAULT_ROBOT_TEAM_MODE = "three_nova_carter_v1"
+DEFAULT_COLLECTION_METADATA_FILENAME = "collection_metadata.yaml"
+DEFAULT_RANDOMIZATION_STRENGTH = "balanced"
+DEFAULT_SCENES_PER_TEMPLATE = 5
 DEFAULT_ROLLOUT_CONTROL_TOPIC = os.environ.get(
     "CARTER_ROLLOUT_CONTROL_TOPIC",
     "/carters_goal/rollout_control",
@@ -50,6 +54,8 @@ class BundleBuildSpec:
     variant_id: str
     scene_id: str
     seed: int
+    template_scene_index: int
+    scene_number: int
 
 
 def _load_builder_class():
@@ -66,6 +72,39 @@ def _load_language_instruction(reference_config_path: Path) -> str:
     return str(payload.get("language_instruction", "") or "").strip()
 
 
+def build_collection_metadata_payload(language_instruction: str) -> dict[str, str]:
+    return {
+        "language_instruction": str(language_instruction).strip(),
+        "focus_selector": DEFAULT_FOCUS_SELECTOR_ID,
+        "robot_team_mode": DEFAULT_ROBOT_TEAM_MODE,
+    }
+
+
+def _collection_metadata_path(scene_root_dir: Path) -> Path:
+    return Path(scene_root_dir).expanduser().resolve() / DEFAULT_COLLECTION_METADATA_FILENAME
+
+
+def _load_collection_metadata_language(scene_root_dir: Path) -> str:
+    metadata_path = _collection_metadata_path(scene_root_dir)
+    if not metadata_path.exists():
+        return ""
+    with metadata_path.open("r", encoding="utf-8") as stream:
+        payload = yaml.safe_load(stream) or {}
+    return str(payload.get("language_instruction", "") or "").strip()
+
+
+def _write_collection_metadata(scene_root_dir: Path, language_instruction: str) -> Path:
+    metadata_path = _collection_metadata_path(scene_root_dir)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("w", encoding="utf-8") as stream:
+        yaml.safe_dump(
+            build_collection_metadata_payload(language_instruction),
+            stream,
+            sort_keys=False,
+        )
+    return metadata_path
+
+
 def _parse_robot_models(value: str) -> list[str]:
     return [token.strip() for token in str(value).split(",") if token.strip()]
 
@@ -77,16 +116,24 @@ def _template_sort_key(template_id: str) -> tuple[int, str]:
     return (1, clean_template_id)
 
 
-def _derive_bundle_seed(base_seed: int, template_id: str, variant_id: str) -> int:
+def _derive_bundle_seed(
+    base_seed: int,
+    template_id: str,
+    variant_id: str,
+    template_scene_index: int = 1,
+) -> int:
     digest = hashlib.sha256(
-        f"{int(base_seed)}::{str(template_id).strip()}::{str(variant_id).strip()}".encode("utf-8")
+        (
+            f"{int(base_seed)}::{str(template_id).strip()}::"
+            f"{str(variant_id).strip()}::{int(template_scene_index)}"
+        ).encode("utf-8")
     ).digest()
     derived_seed = int.from_bytes(digest[:8], "big") % (2**31 - 1)
     return derived_seed or 1
 
 
-def _build_scene_id(template_id: str, variant_id: str, scene_id_prefix: str = "") -> str:
-    base_scene_id = f"template_{str(template_id).strip()}_{str(variant_id).strip()}"
+def _build_scene_id(scene_number: int, scene_id_prefix: str = "") -> str:
+    base_scene_id = f"scene_{int(scene_number)}"
     clean_prefix = str(scene_id_prefix).strip()
     return base_scene_id if not clean_prefix else f"{clean_prefix}_{base_scene_id}"
 
@@ -124,7 +171,31 @@ def _parse_selected_variant_ids(*, variants: list[str], base_only: bool) -> tupl
             clean_token = token.strip()
             if clean_token:
                 requested_variant_ids.append(clean_token)
-    return _normalize_variant_ids(tuple(requested_variant_ids) if requested_variant_ids else None)
+    if requested_variant_ids:
+        selected = _normalize_variant_ids(tuple(requested_variant_ids))
+        if len(selected) != 1:
+            raise ValueError(
+                "Randomized warehouse generation now uses one randomization strength per batch. "
+                "Pass a single --variant value or use --randomization-strength."
+            )
+        return selected
+    return (DEFAULT_RANDOMIZATION_STRENGTH,)
+
+
+def _parse_randomization_strength(
+    *,
+    randomization_strength: str,
+    variants: list[str],
+    base_only: bool,
+) -> str:
+    if base_only or variants:
+        return _parse_selected_variant_ids(variants=variants, base_only=base_only)[0]
+
+    clean_strength = str(randomization_strength).strip() or DEFAULT_RANDOMIZATION_STRENGTH
+    selected = _normalize_variant_ids((clean_strength,))
+    if len(selected) != 1:
+        raise ValueError(f"Expected one randomization strength, got {selected}.")
+    return selected[0]
 
 
 def plan_bundle_specs(
@@ -134,14 +205,18 @@ def plan_bundle_specs(
     all_template: bool = False,
     scene_id_prefix: str = "",
     base_seed: int,
-    variant_ids: tuple[str, ...] = DEFAULT_VARIANT_IDS,
+    randomization_strength: str = DEFAULT_RANDOMIZATION_STRENGTH,
+    scenes_per_template: int = DEFAULT_SCENES_PER_TEMPLATE,
 ) -> list[BundleBuildSpec]:
     available_ids = sorted({str(value).strip() for value in available_template_ids if str(value).strip()}, key=_template_sort_key)
     if not available_ids:
         raise ValueError("No template ids are available for planning.")
     if all_template and str(scene_id_prefix).strip():
         raise ValueError("--scene-id cannot be used together with --all_template.")
-    selected_variant_ids = _normalize_variant_ids(variant_ids)
+    if int(scenes_per_template) <= 0:
+        raise ValueError(f"scenes_per_template must be positive, got {scenes_per_template}.")
+    clean_strength = str(randomization_strength).strip() or DEFAULT_RANDOMIZATION_STRENGTH
+    selected_variant_id = _normalize_variant_ids((clean_strength,))[0]
 
     clean_requested_template_id = str(requested_template_id).strip()
     if all_template:
@@ -157,13 +232,22 @@ def plan_bundle_specs(
 
     specs: list[BundleBuildSpec] = []
     for template_id in selected_template_ids:
-        for variant_id in selected_variant_ids:
+        template_offset = available_ids.index(template_id) * int(scenes_per_template)
+        for template_scene_index in range(1, int(scenes_per_template) + 1):
+            scene_number = template_offset + template_scene_index
             specs.append(
                 BundleBuildSpec(
                     template_id=template_id,
-                    variant_id=variant_id,
-                    scene_id=_build_scene_id(template_id, variant_id, scene_id_prefix),
-                    seed=_derive_bundle_seed(base_seed, template_id, variant_id),
+                    variant_id=selected_variant_id,
+                    scene_id=_build_scene_id(scene_number, scene_id_prefix),
+                    seed=_derive_bundle_seed(
+                        base_seed,
+                        template_id,
+                        selected_variant_id,
+                        template_scene_index,
+                    ),
+                    template_scene_index=template_scene_index,
+                    scene_number=scene_number,
                 )
             )
     return specs
@@ -173,7 +257,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create runnable randomized warehouse scene bundles from manually authored "
-            "warehouse_template_<id>.usd assets, including base, balanced, messy, and open variants."
+            "warehouse_template_<id>.usd assets."
         )
     )
     parser.add_argument(
@@ -184,7 +268,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scene-id",
         default="",
-        help="Optional per-template scene-id prefix, producing folders like <prefix>_template_1_balanced.",
+        help="Optional scene-id prefix, producing folders like <prefix>_scene_1.",
     )
     parser.add_argument(
         "--template-registry-dir",
@@ -204,12 +288,28 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--randomization-strength",
+        default=DEFAULT_RANDOMIZATION_STRENGTH,
+        help=(
+            "Randomization strength preset to use for every generated scene. "
+            f"Defaults to '{DEFAULT_RANDOMIZATION_STRENGTH}'."
+        ),
+    )
+    parser.add_argument(
+        "--scenes-per-template",
+        type=int,
+        default=DEFAULT_SCENES_PER_TEMPLATE,
+        help=(
+            "Number of randomized scenes to generate per selected manual template. "
+            f"Defaults to {DEFAULT_SCENES_PER_TEMPLATE}."
+        ),
+    )
+    parser.add_argument(
         "--variant",
         action="append",
         default=[],
         help=(
-            "Variant id(s) to generate. May be passed multiple times or as a comma-separated list, "
-            "for example '--variant base' or '--variant base,balanced'. Defaults to all variants."
+            "Deprecated alias for --randomization-strength. Pass only one value."
         ),
     )
     parser.add_argument(
@@ -239,7 +339,7 @@ def _parse_args() -> argparse.Namespace:
         "--robot-count",
         type=int,
         default=3,
-        help="How many robots to spawn after map validation. Must be between 2 and 5.",
+        help="How many robot poses to sample. Must be between 2 and 5.",
     )
     parser.add_argument(
         "--robot-models",
@@ -256,10 +356,28 @@ def _parse_args() -> argparse.Namespace:
         help="How many rollouts to sample into each generated team config.",
     )
     parser.add_argument(
-        "--reference-config-file",
-        default=str(DEFAULT_REFERENCE_CONFIG),
+        "--scene-only",
+        action="store_true",
         help=(
-            "YAML file used to source a default language instruction when --language-instruction is omitted."
+            "Generate only the randomized warehouse scene USD and maps. "
+            "Skip robot pose sampling, team_config.yaml, and robot spawning."
+        ),
+    )
+    parser.add_argument(
+        "--spawn-robots-only",
+        action="store_true",
+        help=(
+            "Load an existing scene bundle and spawn robots into the live stage without saving "
+            "them into scene.usd. Existing team_config.yaml is reused unless --overwrite is set; "
+            "missing/overwritten team configs are sampled from the existing scene maps."
+        ),
+    )
+    parser.add_argument(
+        "--reference-config-file",
+        default="",
+        help=(
+            "Optional legacy YAML language fallback used only when --language-instruction "
+            "and collection_metadata.yaml are absent."
         ),
     )
     parser.add_argument(
@@ -355,6 +473,8 @@ def _build_scene_bundle(
     keep_sim_running: bool,
     sim_app=None,
     close_sim_app_when_done: bool = False,
+    scene_only: bool = False,
+    spawn_robots_only: bool = False,
 ):
     builder_cls = _load_builder_class()
     builder = builder_cls(
@@ -372,6 +492,8 @@ def _build_scene_bundle(
         rollout_control_topic=rollout_control_topic,
         rollout_reset_done_topic=rollout_reset_done_topic,
         overwrite=overwrite,
+        scene_only=scene_only,
+        spawn_robots_only=spawn_robots_only,
     )
 
     active_sim_app = sim_app
@@ -398,23 +520,37 @@ def _print_bundle_result(result) -> None:
     print(f"  variant: {result.variant_id}", flush=True)
     print(f"  bundle_dir: {result.bundle_dir}", flush=True)
     print(f"  scene_usd: {result.scene_usd_path}", flush=True)
-    print(f"  team_config: {result.team_config_path}", flush=True)
+    has_team_config = result.team_config_path.exists()
+    if has_team_config:
+        print(f"  team_config: {result.team_config_path}", flush=True)
+    else:
+        print(f"  team_config: skipped", flush=True)
     print(f"  nav2_map: {result.nav2_map_path}", flush=True)
     print(f"  mapf_map: {result.mapf_map_path}", flush=True)
-    print(
-        "  ros_launch_hint: "
-        f"ros2 launch carters_goal isaac_ros_mapf_rollouts.launch.py "
-        f"team_config_file:={result.team_config_path} experiments_dir:={result.rollouts_dir}",
-        flush=True,
-    )
+    if has_team_config:
+        print(
+            "  ros_launch_hint: "
+            f"ros2 launch carters_goal isaac_ros_mapf_rollouts.launch.py "
+            f"team_config_file:={result.team_config_path} experiments_dir:={result.rollouts_dir}",
+            flush=True,
+        )
 
 
 def main() -> int:
     args = _parse_args()
-    reference_config_path = Path(args.reference_config_file).expanduser().resolve()
+    if args.scene_only and args.spawn_robots_only:
+        print("[ERROR] --scene-only cannot be combined with --spawn-robots-only.", file=sys.stderr)
+        return 2
+    scene_root_dir = Path(args.scene_root_dir).expanduser().resolve()
     language_instruction = str(args.language_instruction).strip()
     if not language_instruction:
-        language_instruction = _load_language_instruction(reference_config_path)
+        language_instruction = _load_collection_metadata_language(scene_root_dir)
+    if not language_instruction and str(args.reference_config_file).strip():
+        language_instruction = _load_language_instruction(
+            Path(args.reference_config_file).expanduser().resolve()
+        )
+    if not language_instruction:
+        language_instruction = DEFAULT_COLLECTION_LANGUAGE_INSTRUCTION
 
     template_registry_dirs = args.template_registry_dir or None
     shared_defaults = load_shared_warehouse_defaults(
@@ -439,7 +575,8 @@ def main() -> int:
         template_registry_dirs=template_registry_dirs,
     )
     try:
-        selected_variant_ids = _parse_selected_variant_ids(
+        selected_randomization_strength = _parse_randomization_strength(
+            randomization_strength=args.randomization_strength,
             variants=list(args.variant),
             base_only=bool(args.base_only),
         )
@@ -447,7 +584,7 @@ def main() -> int:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 2
 
-    required_preset_ids = sorted(set(selected_variant_ids) - {DEFAULT_BASE_VARIANT_ID})
+    required_preset_ids = sorted({selected_randomization_strength} - {DEFAULT_BASE_VARIANT_ID})
     missing_presets = sorted(set(required_preset_ids) - set(presets))
     if missing_presets:
         print(
@@ -457,6 +594,9 @@ def main() -> int:
         return 2
 
     run_sim = bool(args.run_sim)
+    if args.scene_only and args.enable_ros2_runtime:
+        print("[INFO] Ignoring --enable-ros2-runtime because --scene-only does not spawn robots.")
+        args.enable_ros2_runtime = False
     if args.enable_ros2_runtime and not run_sim:
         print("[INFO] Enabling --run-sim because --enable-ros2-runtime requires a live Isaac process.")
         run_sim = True
@@ -472,7 +612,8 @@ def main() -> int:
             all_template=bool(args.all_template),
             scene_id_prefix=args.scene_id,
             base_seed=base_seed,
-            variant_ids=selected_variant_ids,
+            randomization_strength=selected_randomization_strength,
+            scenes_per_template=int(args.scenes_per_template),
         )
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -491,7 +632,7 @@ def main() -> int:
             flush=True,
         )
 
-    scene_root_dir = Path(args.scene_root_dir).expanduser().resolve()
+    _write_collection_metadata(scene_root_dir, language_instruction)
     final_result = None
     shared_sim_app = None
     shared_headless = requested_headless
@@ -527,6 +668,8 @@ def main() -> int:
                 keep_sim_running=keep_sim_running,
                 sim_app=shared_sim_app,
                 close_sim_app_when_done=False,
+                scene_only=bool(args.scene_only),
+                spawn_robots_only=bool(args.spawn_robots_only),
             )
             _print_bundle_result(result)
             shared_sim_app = sim_app

@@ -3,7 +3,7 @@ description: Starter template with heavier geometry clutter and wider pose varia
 metadata:
   layout_class: messy
 
-focus_distance_range_m: [2.25, 5.0]
+focus_distance_range_m: [2.25, 4.0]
 
 light_randomizer_overrides:
   warehouse_lights:

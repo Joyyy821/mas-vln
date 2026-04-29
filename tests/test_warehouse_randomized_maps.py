@@ -10,11 +10,13 @@ import unittest
 import numpy as np
 import yaml
 
+from isaac_sim.goal_generator.object_goal_sampler_utils import OccupancyMap
 from isaac_sim.stage_bringups.warehouse_randomized import maps as maps_module
 from isaac_sim.stage_bringups.warehouse_randomized.maps import (
     MapExportResult,
     _export_occupancy_map,
     _export_resampled_occupancy_map,
+    sample_multi_robot_rollouts,
 )
 
 
@@ -101,6 +103,26 @@ class _FakeGenerator:
 class _BadBufferGenerator(_FakeGenerator):
     def get_buffer(self):
         return [0, 254, 205]
+
+
+def _free_occupancy_map(width: int = 20, height: int = 20, resolution_m: float = 1.0) -> OccupancyMap:
+    grayscale = np.ones((height, width), dtype=float)
+    occupied = np.zeros((height, width), dtype=bool)
+    free = np.ones((height, width), dtype=bool)
+    unknown = np.zeros((height, width), dtype=bool)
+    return OccupancyMap(
+        image_path="",
+        resolution_m=float(resolution_m),
+        origin_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
+        negate=False,
+        occupied_thresh=0.65,
+        free_thresh=0.196,
+        grayscale_01=grayscale,
+        occupancy_probability=np.zeros_like(grayscale, dtype=float),
+        occupied_mask=occupied,
+        free_mask=free,
+        unknown_mask=unknown,
+    )
 
 
 class WarehouseRandomizedMapsTests(unittest.TestCase):
@@ -223,6 +245,52 @@ class WarehouseRandomizedMapsTests(unittest.TestCase):
         self.assertEqual(result.free_cells, 2)
         self.assertEqual(resampled[0, 0], 0)
         self.assertEqual(resampled[1, 1], 205)
+
+    def test_rollout_sampler_excludes_initial_poses_near_focus_area(self) -> None:
+        occupancy_map = _free_occupancy_map()
+        focus_xy = np.array([5.0, 5.0], dtype=float)
+        rollouts, validation = sample_multi_robot_rollouts(
+            occupancy_map=occupancy_map,
+            robot_names=["robot1", "robot2", "robot3"],
+            rollout_count=3,
+            rng=np.random.default_rng(7),
+            inflation_radius_m=0.0,
+            min_pairwise_distance_m=1.0,
+            min_goal_distance_m=2.0,
+            focus_xy=focus_xy,
+            focus_distance_range_m=(2.0, 3.0),
+            min_initial_focus_distance_m=6.0,
+        )
+
+        self.assertEqual(len(rollouts), 3)
+        self.assertGreater(validation["initial_pose_candidates"], 0)
+        self.assertGreater(validation["goal_pose_candidates"], 0)
+        self.assertEqual(validation["selected_focus_xy"], [5.0, 5.0])
+        self.assertGreaterEqual(validation["observed_min_initial_focus_distance_m"], 6.0)
+        self.assertGreaterEqual(validation["observed_min_initial_goal_distance_m"], 2.0)
+        for rollout in rollouts:
+            for robot in rollout["robots"]:
+                initial = robot["initial_pose"]
+                distance_to_focus = float(
+                    np.linalg.norm(np.array([initial["x"], initial["y"]], dtype=float) - focus_xy)
+                )
+                self.assertGreaterEqual(distance_to_focus, 6.0)
+
+    def test_rollout_sampler_fails_when_focus_annulus_has_no_candidates(self) -> None:
+        occupancy_map = _free_occupancy_map()
+
+        with self.assertRaisesRegex(RuntimeError, "focus-distance range"):
+            sample_multi_robot_rollouts(
+                occupancy_map=occupancy_map,
+                robot_names=["robot1", "robot2", "robot3"],
+                rollout_count=1,
+                rng=np.random.default_rng(7),
+                inflation_radius_m=0.0,
+                min_pairwise_distance_m=1.0,
+                min_goal_distance_m=2.0,
+                focus_xy=(5.0, 5.0),
+                focus_distance_range_m=(50.0, 60.0),
+            )
 
 
 if __name__ == "__main__":

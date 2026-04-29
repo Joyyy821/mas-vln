@@ -60,7 +60,10 @@ def _shared_defaults_payload() -> dict:
         "object_groups": [
             {
                 "group_id": "focus_objects",
-                "selectors": [{"mode": "exact_path", "value": "/World/Forklift"}],
+                "selectors": [
+                    {"mode": "exact_path", "value": "/World/Forklift"},
+                    {"mode": "exact_path", "value": "/World/Forklift_01"},
+                ],
             },
             {
                 "group_id": "appearance_props",
@@ -69,7 +72,10 @@ def _shared_defaults_payload() -> dict:
             },
             {
                 "group_id": "forklifts",
-                "selectors": [{"mode": "exact_path", "value": "/World/Forklift"}],
+                "selectors": [
+                    {"mode": "exact_path", "value": "/World/Forklift"},
+                    {"mode": "exact_path", "value": "/World/Forklift_01"},
+                ],
             },
             {
                 "group_id": "small_loose_props",
@@ -159,6 +165,21 @@ class WarehouseRandomizedTemplateTests(unittest.TestCase):
             self.assertNotIn("ground_contact_max_z_m", payload[map_key])
             self.assertNotIn("obstacle_group_names", payload[map_key])
             self.assertNotIn("include_outer_bounds_perimeter", payload[map_key])
+
+        group_map = {group["group_id"]: group for group in payload["object_groups"]}
+        focus_paths = {
+            selector["value"]
+            for selector in group_map["focus_objects"]["selectors"]
+            if selector["mode"] == "exact_path"
+        }
+        self.assertIn("/World/Env/Warehouse/Forklift", focus_paths)
+        self.assertIn("/World/Env/Warehouse/Forklift_01", focus_paths)
+
+        for zone in payload["placement_zones"]:
+            self.assertGreaterEqual(zone["min_xyz"][0], -10.0)
+            self.assertLessEqual(zone["max_xyz"][0], 10.0)
+            self.assertGreaterEqual(zone["min_xyz"][1], -15.5)
+            self.assertLessEqual(zone["max_xyz"][1], 17.5)
 
     def test_discover_template_assets_parses_numeric_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

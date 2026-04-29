@@ -25,6 +25,14 @@ def _load_team_config_utils():
 team_config_utils = _load_team_config_utils()
 
 
+RANDOMIZED_BUNDLE_MARKERS = (
+    "scene.usd",
+    "scene_manifest.yaml",
+    "nav2_map.yaml",
+    "mapf_map.yaml",
+)
+
+
 def find_repo_root(search_paths: list[Path]) -> Path:
     for root in search_paths:
         resolved = root.resolve()
@@ -44,7 +52,50 @@ def resolve_experiments_root(experiments_dir: str, team_config_path: Path | str)
     return repo_root / "experiments"
 
 
-def rollout_run_dir(experiments_dir: str, team_config_path: Path | str, rollout_id: int) -> Path:
+def randomized_scene_bundle_dir(team_config_path: Path | str) -> Path | None:
     team_config_path = Path(team_config_path).expanduser().resolve()
-    experiments_root = resolve_experiments_root(experiments_dir, team_config_path)
-    return experiments_root / team_config_path.stem.strip() / str(rollout_id)
+    if team_config_path.name != "team_config.yaml":
+        return None
+
+    bundle_dir = team_config_path.parent
+    if bundle_dir.parent.name == "randomized_warehouse":
+        return bundle_dir
+    if any((bundle_dir / marker).exists() for marker in RANDOMIZED_BUNDLE_MARKERS):
+        return bundle_dir
+    return None
+
+
+def rollout_output_base_dir(experiments_dir: str, team_config_path: Path | str) -> Path:
+    team_config_path = Path(team_config_path).expanduser().resolve()
+    bundle_dir = randomized_scene_bundle_dir(team_config_path)
+
+    if experiments_dir:
+        output_root = Path(experiments_dir).expanduser().resolve()
+        if bundle_dir is not None and output_root == bundle_dir:
+            return output_root / "rollouts"
+        if output_root.name == "rollouts":
+            return output_root
+        return output_root / team_config_path.stem.strip()
+
+    if bundle_dir is not None:
+        return bundle_dir / "rollouts"
+
+    experiments_root = resolve_experiments_root("", team_config_path)
+    return experiments_root / team_config_path.stem.strip()
+
+
+def use_rollout_id_run_directory(experiments_dir: str, team_config_path: Path | str) -> bool:
+    team_config_path = Path(team_config_path).expanduser().resolve()
+    bundle_dir = randomized_scene_bundle_dir(team_config_path)
+
+    if experiments_dir:
+        output_root = Path(experiments_dir).expanduser().resolve()
+        return output_root.name == "rollouts" or (
+            bundle_dir is not None and output_root == bundle_dir
+        )
+
+    return bundle_dir is not None
+
+
+def rollout_run_dir(experiments_dir: str, team_config_path: Path | str, rollout_id: int) -> Path:
+    return rollout_output_base_dir(experiments_dir, team_config_path) / str(rollout_id)

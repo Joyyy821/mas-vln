@@ -3,7 +3,7 @@ description: Open starter template with lighter clutter and larger free corridor
 metadata:
   layout_class: open
 
-focus_distance_range_m: [2.5, 5.75]
+focus_distance_range_m: [2.5, 4.0]
 
 light_randomizer_overrides:
   warehouse_lights:

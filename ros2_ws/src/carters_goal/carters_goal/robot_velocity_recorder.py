@@ -22,8 +22,10 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from carters_goal.rollout_control import parse_rollout_id
 from carters_goal.shared_team_config import (
     resolve_experiments_root,
+    rollout_output_base_dir,
     rollout_run_dir,
     team_config_utils,
+    use_rollout_id_run_directory,
 )
 
 
@@ -224,9 +226,25 @@ class RobotVelocityRecorder(Node):
         self._close_active_rollout()
 
         if use_legacy_directory:
-            run_config_dir = self._experiments_root / self._team_config_path.stem.strip()
-            run_id = _next_run_id(run_config_dir)
-            run_dir = run_config_dir / str(run_id)
+            if use_rollout_id_run_directory(self._experiments_dir, self._team_config_path):
+                run_id = rollout_id
+                run_dir = rollout_run_dir(
+                    self._experiments_dir,
+                    team_config_path=self._team_config_path,
+                    rollout_id=rollout_id,
+                )
+                if run_dir.exists():
+                    raise RuntimeError(
+                        f"Refusing to overwrite existing rollout directory {run_dir}. "
+                        "Use a fresh rollout id or archive the existing directory."
+                    )
+            else:
+                run_config_dir = rollout_output_base_dir(
+                    self._experiments_dir,
+                    self._team_config_path,
+                )
+                run_id = _next_run_id(run_config_dir)
+                run_dir = run_config_dir / str(run_id)
         else:
             run_id = rollout_id
             run_dir = rollout_run_dir(

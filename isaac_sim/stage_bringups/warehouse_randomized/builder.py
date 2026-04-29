@@ -31,6 +31,10 @@ from isaac_sim.stage_bringups.warehouse_randomized.maps import (
     _export_resampled_occupancy_map,
     sample_multi_robot_rollouts,
 )
+from isaac_sim.stage_bringups.warehouse_randomized.instructions.forklift_near_shelf import (
+    FOCUS_SELECTOR_ID,
+    select_focus_object,
+)
 from isaac_sim.stage_bringups.warehouse_randomized.robots import (
     RuntimeRobotController,
     build_robot_adapter,
@@ -50,6 +54,13 @@ OMAP_EXTENSION_NAME = "isaacsim.asset.gen.omap"
 OMAP_DEFAULT_Z_MIN = 0.1
 OMAP_DEFAULT_Z_MAX = 0.62
 OMAP_PHYSICS_WARMUP_UPDATES = 120
+DEFAULT_ROBOT_TEAM_MODE = "three_nova_carter_v1"
+ROS_COSTMAP_PARAMS_RELS = (
+    Path("ros2_ws/src/carters_goal/config/mapf_costmap_params_isaac.yaml"),
+    Path("ros2_ws/src/carters_nav2/config/warehouse/multi_robot_carter_rpp_controller_only_params.yaml"),
+    Path("ros2_ws/src/carters_nav2/config/warehouse/multi_robot_carter_navigation_params_1.yaml"),
+)
+DEFAULT_ROS_COSTMAP_INFLATION_RADIUS_M = 1.0
 
 
 @dataclass
@@ -89,6 +100,8 @@ class RandomizedWarehouseBuilder:
         rollout_control_topic: str,
         rollout_reset_done_topic: str,
         overwrite: bool = False,
+        scene_only: bool = False,
+        spawn_robots_only: bool = False,
     ) -> None:
         self._repo_root = Path(repo_root).expanduser().resolve()
         self._scene_root_dir = Path(scene_root_dir).expanduser().resolve()
@@ -102,6 +115,11 @@ class RandomizedWarehouseBuilder:
         self._rollout_control_topic = str(rollout_control_topic).strip()
         self._rollout_reset_done_topic = str(rollout_reset_done_topic).strip()
         self._overwrite = bool(overwrite)
+        self._scene_only = bool(scene_only)
+        self._spawn_robots_only = bool(spawn_robots_only)
+
+        if self._scene_only and self._spawn_robots_only:
+            raise ValueError("scene_only and spawn_robots_only cannot both be true.")
 
         if self._robot_count < 2 or self._robot_count > 5:
             raise ValueError(f"robot_count must be between 2 and 5, got {self._robot_count}.")
@@ -134,6 +152,7 @@ class RandomizedWarehouseBuilder:
         self._rollouts_dir = self._bundle_dir / "rollouts"
         self._nav2_map_path = self._bundle_dir / "nav2_map.yaml"
         self._mapf_map_path = self._bundle_dir / "mapf_map.yaml"
+        self._collection_metadata_path = self._scene_root_dir / "collection_metadata.yaml"
 
         self._env_prim_path = "/World/Env/Warehouse"
         self._randomized_props_root = "/World/Env/RandomizedProps"
@@ -150,6 +169,7 @@ class RandomizedWarehouseBuilder:
         self._nav2_map_result: MapExportResult | None = None
         self._mapf_map_result: MapExportResult | None = None
         self._focus_object: ObjectBBox3D | None = None
+        self._focus_selection_debug: dict[str, Any] = {}
         self._rollouts_payload: list[dict[str, Any]] = []
         self._sampling_validation: dict[str, Any] = {}
         self._robot_prim_paths: list[str] = []
@@ -176,6 +196,9 @@ class RandomizedWarehouseBuilder:
         )
 
     def build(self) -> RandomizedWarehouseBuildResult:
+        if self._spawn_robots_only:
+            return self._build_spawn_robots_only()
+
         current_step = "prepare_output_bundle"
         try:
             self._prepare_output_bundle()
@@ -189,14 +212,74 @@ class RandomizedWarehouseBuilder:
             self._resolve_focus_object()
             current_step = "export_maps"
             self._export_maps()
-            current_step = "sample_rollouts"
-            self._sample_rollouts()
-            current_step = "spawn_robots"
-            self._spawn_robots()
             current_step = "save_scene_usd"
             self._save_scene_usd()
+            if not self._scene_only:
+                current_step = "sample_rollouts"
+                self._sample_rollouts()
+                if self._enable_ros2_runtime:
+                    current_step = "spawn_robots"
+                    self._spawn_robots()
             current_step = "write_team_config"
-            self._write_team_config()
+            if not self._scene_only:
+                self._write_team_config()
+            current_step = "write_manifest"
+            self._write_manifest()
+            if self._enable_ros2_runtime and not self._scene_only:
+                current_step = "initialize_ros_runtime"
+                self._initialize_ros_runtime()
+            if self._failure_snapshot_path.exists():
+                try:
+                    self._failure_snapshot_path.unlink()
+                except Exception:
+                    pass
+        except Exception as exc:
+            self._write_failure_snapshot(current_step=current_step, exception=exc)
+            raise RuntimeError(
+                f"Randomized warehouse build failed during step '{current_step}' "
+                f"for scene '{self._scene_id}'."
+            ) from exc
+
+        return RandomizedWarehouseBuildResult(
+            scene_id=self._scene_id,
+            seed=self._seed,
+            template_id=self._template.template_id,
+            variant_id=self._template.variant_id,
+            bundle_dir=self._bundle_dir,
+            scene_usd_path=self._scene_usd_path,
+            team_config_path=self._team_config_path,
+            nav2_map_path=self._nav2_map_path,
+            mapf_map_path=self._mapf_map_path,
+            manifest_path=self._manifest_path,
+            robot_prim_paths=list(self._robot_prim_paths),
+            rollouts_dir=self._rollouts_dir,
+            ros_bridge=self._ros_bridge,
+            robot_controllers=list(self._robot_controllers),
+            validation_summary=self._build_validation_summary(),
+        )
+
+    def _build_spawn_robots_only(self) -> RandomizedWarehouseBuildResult:
+        current_step = "prepare_spawn_robots_only_bundle"
+        try:
+            self._prepare_spawn_robots_only_bundle()
+            current_step = "resolve_assets_root"
+            self._resolve_assets_root()
+            current_step = "open_existing_scene_usd"
+            self._open_existing_scene_usd()
+            current_step = "resolve_focus_object"
+            self._resolve_focus_object()
+            using_existing_team_config = self._team_config_path.exists() and not self._overwrite
+            if using_existing_team_config:
+                current_step = "load_existing_team_config"
+                self._load_existing_team_config()
+            else:
+                current_step = "sample_rollouts"
+                self._sample_rollouts()
+            current_step = "spawn_robots"
+            self._spawn_robots()
+            if not using_existing_team_config:
+                current_step = "write_team_config"
+                self._write_team_config()
             current_step = "write_manifest"
             self._write_manifest()
             if self._enable_ros2_runtime:
@@ -210,7 +293,7 @@ class RandomizedWarehouseBuilder:
         except Exception as exc:
             self._write_failure_snapshot(current_step=current_step, exception=exc)
             raise RuntimeError(
-                f"Randomized warehouse build failed during step '{current_step}' "
+                f"Randomized warehouse spawn-robots-only failed during step '{current_step}' "
                 f"for scene '{self._scene_id}'."
             ) from exc
 
@@ -246,11 +329,41 @@ class RandomizedWarehouseBuilder:
                 )
         self._bundle_dir.mkdir(parents=True, exist_ok=True)
         self._rollouts_dir.mkdir(parents=True, exist_ok=True)
+        self._write_collection_metadata()
         if self._failure_snapshot_path.exists():
             try:
                 self._failure_snapshot_path.unlink()
             except Exception:
                 pass
+
+    def _prepare_spawn_robots_only_bundle(self) -> None:
+        if not self._bundle_dir.exists():
+            raise FileNotFoundError(
+                f"Scene bundle does not exist for spawn-robots-only mode: {self._bundle_dir}"
+            )
+        if not self._scene_usd_path.exists():
+            raise FileNotFoundError(f"Scene USD does not exist: {self._scene_usd_path}")
+        if not self._nav2_map_path.exists():
+            raise FileNotFoundError(f"Nav2 map does not exist: {self._nav2_map_path}")
+        self._rollouts_dir.mkdir(parents=True, exist_ok=True)
+        self._write_collection_metadata()
+        if self._failure_snapshot_path.exists():
+            try:
+                self._failure_snapshot_path.unlink()
+            except Exception:
+                pass
+
+    def _build_collection_metadata_payload(self) -> dict[str, Any]:
+        return {
+            "language_instruction": self._language_instruction,
+            "focus_selector": FOCUS_SELECTOR_ID,
+            "robot_team_mode": DEFAULT_ROBOT_TEAM_MODE,
+        }
+
+    def _write_collection_metadata(self) -> None:
+        self._collection_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._collection_metadata_path.open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(self._build_collection_metadata_payload(), stream, sort_keys=False)
 
     def _resolve_assets_root(self) -> None:
         from isaacsim.storage.native import get_assets_root_path
@@ -757,17 +870,37 @@ class RandomizedWarehouseBuilder:
         import omni.usd
 
         self._remove_prim(dest_prim_path)
+        stage = get_stage()
+        duplicate_prim = getattr(omni.usd, "duplicate_prim", None)
+        if callable(duplicate_prim):
+            try:
+                duplicate_prim(stage, source_prim_path, dest_prim_path)
+            except Exception:
+                pass
+            else:
+                copied_prim = stage.GetPrimAtPath(dest_prim_path)
+                if copied_prim and copied_prim.IsValid():
+                    return
+
         try:
-            omni.kit.commands.execute(
-                "CopyPrim",
-                path_from=source_prim_path,
-                path_to=dest_prim_path,
-            )
+            try:
+                omni.kit.commands.execute(
+                    "CopyPrim",
+                    path_from=source_prim_path,
+                    path_to=dest_prim_path,
+                    select_new_prim=False,
+                )
+            except Exception:
+                omni.kit.commands.execute(
+                    "CopyPrim",
+                    path_from=source_prim_path,
+                    path_to=dest_prim_path,
+                )
         except Exception:
-            duplicate_prim = getattr(omni.usd, "duplicate_prim", None)
             if callable(duplicate_prim):
-                duplicate_prim(get_stage(), source_prim_path, dest_prim_path)
-        copied_prim = get_stage().GetPrimAtPath(dest_prim_path)
+                duplicate_prim(stage, source_prim_path, dest_prim_path)
+
+        copied_prim = stage.GetPrimAtPath(dest_prim_path)
         if not copied_prim or not copied_prim.IsValid():
             raise RuntimeError(
                 f"Failed to copy source prim '{source_prim_path}' to '{dest_prim_path}'."
@@ -964,6 +1097,34 @@ class RandomizedWarehouseBuilder:
                 accepted_zone_id = zone_id
                 accepted_from_original = False
                 break
+
+            if accepted_bbox is None and ordered_candidate_zones:
+                self._record_rejection(spec.name, "unplaced_in_zone")
+                if spec.required:
+                    set_xform_pose(
+                        object_path,
+                        tuple(original_position.tolist()),
+                        yaw_deg=original_yaw_deg,
+                    )
+                    raise RuntimeError(
+                        f"Required object '{object_path}' from randomizer '{spec.name}' "
+                        "could not be placed inside its configured warehouse zones."
+                    )
+                self._remove_prim(object_path)
+                self._randomization_records.append(
+                    {
+                        "category": "layout_skip",
+                        "name": spec.name,
+                        "prim_path": object_path,
+                        "policy": spec.policy,
+                        "target_group_name": spec.target_group_name,
+                        "reason": "unplaced_in_zone",
+                        "candidate_zone_ids": [
+                            zone.zone_id for zone in ordered_candidate_zones
+                        ],
+                    }
+                )
+                continue
 
             if not accepted_zone_id and ordered_candidate_zones and reserve_unique_zones:
                 accepted_zone_id = self._nearest_zone_id_for_position(
@@ -1166,19 +1327,17 @@ class RandomizedWarehouseBuilder:
         for group_name in self._template.focus_group_names:
             focus_paths.extend(self._resolve_group_paths(group_name, required=False))
         focus_paths = self._dedupe_root_paths(focus_paths)
-        largest_bbox: ObjectBBox3D | None = None
-        largest_area = -1.0
+        candidates: list[ObjectBBox3D] = []
         for focus_path in focus_paths:
             bbox_min, bbox_max = compute_world_bbox(focus_path)
-            area = float((bbox_max[0] - bbox_min[0]) * (bbox_max[1] - bbox_min[1]))
-            if area > largest_area:
-                largest_area = area
-                largest_bbox = ObjectBBox3D(
+            candidates.append(
+                ObjectBBox3D(
                     prim_path=focus_path,
                     min_xyz=bbox_min,
                     max_xyz=bbox_max,
                 )
-        self._focus_object = largest_bbox
+            )
+        self._focus_object, self._focus_selection_debug = select_focus_object(candidates)
 
     def _export_maps(self) -> None:
         self._enable_omap_extension()
@@ -1583,21 +1742,89 @@ class RandomizedWarehouseBuilder:
         max_planar_radius_m = max(
             float(adapter.default_planar_radius_m) for adapter in self._robot_adapters
         )
+        robot_padding_inflation_radius_m = max_planar_radius_m + 0.10
+        ros_costmap_inflation_radius_m = self._ros_costmap_inflation_radius_m()
+        sampling_inflation_radius_m = max(
+            robot_padding_inflation_radius_m,
+            ros_costmap_inflation_radius_m,
+        )
         self._rollouts_payload, self._sampling_validation = sample_multi_robot_rollouts(
             occupancy_map=occupancy_map,
             robot_names=self._robot_names,
             rollout_count=self._rollout_count,
             rng=self._rng,
-            inflation_radius_m=max_planar_radius_m + 0.10,
+            inflation_radius_m=sampling_inflation_radius_m,
             min_pairwise_distance_m=max(1.5, max_planar_radius_m * 2.5),
             min_goal_distance_m=3.0,
             focus_xy=focus_xy,
             focus_distance_range_m=self._template.focus_distance_range_m,
         )
+        self._sampling_validation.update(
+            {
+                "inflation_source": "max_robot_padding_and_ros_costmaps",
+                "robot_padding_inflation_radius_m": float(robot_padding_inflation_radius_m),
+                "ros_costmap_inflation_radius_m": float(ros_costmap_inflation_radius_m),
+                "ros_costmap_params_paths": [
+                    str(self._repo_root / relative_path)
+                    for relative_path in ROS_COSTMAP_PARAMS_RELS
+                ],
+            }
+        )
+
+    def _load_existing_team_config(self) -> None:
+        with self._team_config_path.open("r", encoding="utf-8") as stream:
+            payload = yaml.safe_load(stream) or {}
+        rollouts = list(payload.get("rollouts", []) or [])
+        if not rollouts:
+            raise RuntimeError(f"Existing team config has no rollouts: {self._team_config_path}")
+
+        first_robots = list(rollouts[0].get("robots", []) or [])
+        if not first_robots:
+            raise RuntimeError(
+                f"Existing team config first rollout has no robots: {self._team_config_path}"
+            )
+
+        robot_models = [
+            str(model).strip()
+            for model in (payload.get("robot_models", []) or [])
+            if str(model).strip()
+        ]
+        if not robot_models:
+            robot_model = str(payload.get("robot_model", "nova_carter") or "nova_carter").strip()
+            robot_models = [robot_model]
+        if len(robot_models) == 1:
+            robot_models = robot_models * len(first_robots)
+        if len(robot_models) < len(first_robots):
+            robot_models.extend([robot_models[-1]] * (len(first_robots) - len(robot_models)))
+
+        self._robot_count = len(first_robots)
+        self._robot_names = [
+            str(robot.get("name", f"robot{index}"))
+            for index, robot in enumerate(first_robots, start=1)
+        ]
+        self._robot_adapters = [
+            build_robot_adapter(model_id)
+            for model_id in robot_models[: self._robot_count]
+        ]
+        self._rollout_count = len(rollouts)
+        self._rollouts_payload = rollouts
+        validation = payload.get("validation", {}) or {}
+        self._sampling_validation = dict(validation.get("rollout_sampling", {}) or {})
+        language_instruction = str(payload.get("language_instruction", "") or "").strip()
+        if language_instruction:
+            self._language_instruction = language_instruction
 
     def _spawn_robots(self) -> None:
         if not self._rollouts_payload:
             raise RuntimeError("No rollouts were generated before robot spawning.")
+        stage = get_stage()
+        robots_root = stage.GetPrimAtPath(self._robots_root)
+        if not robots_root or not robots_root.IsValid():
+            define_xform(self._robots_root)
+            robots_root = stage.GetPrimAtPath(self._robots_root)
+        for child in list(robots_root.GetChildren()):
+            stage.RemovePrim(child.GetPath())
+        self._robot_prim_paths = []
 
         first_rollout = self._rollouts_payload[0]
         for index, (robot_name, adapter) in enumerate(zip(self._robot_names, self._robot_adapters), start=1):
@@ -1625,6 +1852,16 @@ class RandomizedWarehouseBuilder:
         import omni.usd
 
         omni.usd.get_context().save_as_stage(str(self._scene_usd_path))
+
+    def _open_existing_scene_usd(self) -> None:
+        import omni.usd
+
+        context = omni.usd.get_context()
+        opened = context.open_stage(str(self._scene_usd_path))
+        if opened is False:
+            raise RuntimeError(f"Failed to open scene USD: {self._scene_usd_path}")
+        self._update_sim(12)
+        self._environment_bbox = self._safe_environment_bbox()
 
     def _initialize_ros_runtime(self) -> None:
         if self._sim_app is None:
@@ -1693,8 +1930,10 @@ class RandomizedWarehouseBuilder:
                     "environment_bbox": self._environment_bbox_dict(),
                     "metadata": dict(self._template.metadata),
                 },
+                "collection_metadata_path": self._collection_metadata_path_string(),
                 "resolved_object_groups": dict(self._resolved_group_details),
                 "resolved_light_selectors": dict(self._resolved_light_paths),
+                "focus_selection": self._focus_selection_debug_payload(),
                 "rejection_summary": dict(self._rejection_summary),
                 "map_export_debug": self._map_export_debug_payload(),
                 "randomization_records": list(self._randomization_records),
@@ -1740,6 +1979,7 @@ class RandomizedWarehouseBuilder:
             "randomized_object_count": len(self._randomization_records),
             "accepted_layout_boxes": len(self._accepted_layout_bboxes),
             "resolved_object_groups": dict(self._resolved_group_details),
+            "focus_selection": self._focus_selection_debug_payload(),
             "rejection_summary": dict(self._rejection_summary),
             "environment_bbox": self._environment_bbox_dict(),
             "nav2_map": None if self._nav2_map_result is None else self._map_result_dict(self._nav2_map_result),
@@ -1759,6 +1999,7 @@ class RandomizedWarehouseBuilder:
             "variant_id": self._template.variant_id,
             "template_definition_path": str(self._template.template_config_path),
             "shared_defaults_config_path": str(self._template.shared_defaults_config_path),
+            "collection_metadata_path": self._collection_metadata_path_string(),
             "preset_config_path": (
                 None if self._template.preset_config_path is None else str(self._template.preset_config_path)
             ),
@@ -1766,18 +2007,26 @@ class RandomizedWarehouseBuilder:
             "seed": int(self._seed),
             "usd_path": str(self._scene_usd_path),
             "robot_model": first_robot_model,
+            "robot_team_mode": DEFAULT_ROBOT_TEAM_MODE,
             "language_instruction": self._language_instruction,
             "environment": {
-                "nav2_map": str(self._nav2_map_path),
-                "mapf_map": str(self._mapf_map_path),
+                "nav2_map": self._bundle_relative_path(self._nav2_map_path),
+                "mapf_map": self._bundle_relative_path(self._mapf_map_path),
             },
             "sampling_contract": {
                 "goal_sampling_mode": "occupancy_map_plus_focus_object",
-                "language_grounded": False,
+                "focus_selector": FOCUS_SELECTOR_ID,
+                "language_grounded": True,
             },
             "rollouts": self._rollouts_payload,
             "validation": self._build_validation_summary(),
         }
+
+    def _bundle_relative_path(self, path: Path) -> str:
+        try:
+            return path.relative_to(self._bundle_dir).as_posix()
+        except ValueError:
+            return str(path)
 
     def _build_manifest_payload(self) -> dict[str, Any]:
         return {
@@ -1801,16 +2050,19 @@ class RandomizedWarehouseBuilder:
                 "metadata": dict(self._template.metadata),
             },
             "scene_usd_path": str(self._scene_usd_path),
+            "collection_metadata_path": self._collection_metadata_path_string(),
             "language_instruction": self._language_instruction,
             "robot_models": [adapter.model_id for adapter in self._robot_adapters],
             "robot_namespaces": list(self._robot_names),
             "focus_object": None if self._focus_object is None else self._focus_object.as_dict(),
+            "focus_selection": self._focus_selection_debug_payload(),
             "resolved_object_groups": dict(self._resolved_group_details),
             "resolved_light_selectors": dict(self._resolved_light_paths),
             "rejection_summary": dict(self._rejection_summary),
             "sampling_contract": {
                 "goal_sampling_mode": "occupancy_map_plus_focus_object",
-                "language_grounded": False,
+                "focus_selector": FOCUS_SELECTOR_ID,
+                "language_grounded": True,
             },
             "randomization_records": self._randomization_records,
             "map_export_debug": self._map_export_debug_payload(),
@@ -2192,6 +2444,43 @@ class RandomizedWarehouseBuilder:
 
     def _map_export_debug_payload(self) -> dict[str, Any]:
         return dict(getattr(self, "_map_export_debug", {}) or {})
+
+    def _ros_costmap_inflation_radius_m(self) -> float:
+        inflation_radii: list[float] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                if "inflation_radius" in node:
+                    try:
+                        inflation_radii.append(float(node["inflation_radius"]))
+                    except (TypeError, ValueError):
+                        pass
+                for value in node.values():
+                    _walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    _walk(value)
+
+        for relative_path in ROS_COSTMAP_PARAMS_RELS:
+            params_path = self._repo_root / relative_path
+            if not params_path.exists():
+                continue
+            with params_path.open("r", encoding="utf-8") as stream:
+                _walk(yaml.safe_load(stream) or {})
+
+        return max(inflation_radii) if inflation_radii else DEFAULT_ROS_COSTMAP_INFLATION_RADIUS_M
+
+    def _focus_selection_debug_payload(self) -> dict[str, Any]:
+        return dict(getattr(self, "_focus_selection_debug", {}) or {})
+
+    def _collection_metadata_path_string(self) -> str:
+        collection_metadata_path = getattr(self, "_collection_metadata_path", None)
+        if collection_metadata_path is not None:
+            return str(collection_metadata_path)
+        team_config_path = getattr(self, "_team_config_path", None)
+        if team_config_path is not None:
+            return str(Path(team_config_path).parent.parent / "collection_metadata.yaml")
+        return ""
 
     def _map_quality_score(self, result: MapExportResult) -> tuple[float, float, int]:
         total_cells = max(1, int(result.width_px) * int(result.height_px))

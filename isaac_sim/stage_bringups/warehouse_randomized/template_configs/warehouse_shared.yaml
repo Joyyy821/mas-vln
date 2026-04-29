@@ -24,7 +24,7 @@ mapf_map:
   occupancy_z_range_m: [0.1, 0.62]
 
 focus_group_names: [focus_objects]
-focus_distance_range_m: [2.5, 5.25]
+focus_distance_range_m: [2.5, 4.0]
 
 keepout_zones:
   - zone_id: main_corridor
@@ -39,32 +39,32 @@ keepout_zones:
 placement_zones:
   - zone_id: forklift_south_east
     zone_type: anchor
-    min_xyz: [2.0, -7.8, 0.0]
-    max_xyz: [6.8, -1.2, 2.5]
+    min_xyz: [2.2, -7.3, 0.0]
+    max_xyz: [6.4, -1.4, 2.5]
   - zone_id: forklift_south_west
     zone_type: anchor
-    min_xyz: [-10.8, -8.0, 0.0]
-    max_xyz: [-5.8, -1.0, 2.5]
+    min_xyz: [-9.8, -7.4, 0.0]
+    max_xyz: [-6.2, -1.4, 2.5]
   - zone_id: forklift_center_east
     zone_type: anchor
-    min_xyz: [3.4, 1.0, 0.0]
-    max_xyz: [8.4, 6.4, 2.5]
+    min_xyz: [3.6, 1.2, 0.0]
+    max_xyz: [7.8, 6.0, 2.5]
   - zone_id: floor_south
     zone_type: support
-    min_xyz: [-10.5, -16.5, 0.0]
-    max_xyz: [9.0, -8.0, 2.0]
+    min_xyz: [-9.5, -15.2, 0.0]
+    max_xyz: [8.5, -8.6, 2.0]
   - zone_id: floor_center_left
     zone_type: support
-    min_xyz: [-10.5, 1.0, 0.0]
-    max_xyz: [-4.2, 8.8, 2.0]
+    min_xyz: [-9.5, 1.2, 0.0]
+    max_xyz: [-4.5, 8.2, 2.0]
   - zone_id: floor_center_right
     zone_type: support
-    min_xyz: [4.2, 1.0, 0.0]
-    max_xyz: [10.5, 8.8, 2.0]
+    min_xyz: [4.5, 1.2, 0.0]
+    max_xyz: [9.5, 8.2, 2.0]
   - zone_id: floor_north
     zone_type: support
-    min_xyz: [-10.0, 11.0, 0.0]
-    max_xyz: [10.0, 18.5, 2.0]
+    min_xyz: [-9.0, 11.4, 0.0]
+    max_xyz: [9.0, 17.2, 2.0]
 
 object_groups:
   - group_id: forklifts
@@ -81,6 +81,8 @@ object_groups:
     selectors:
       - mode: exact_path
         value: /World/Env/Warehouse/Forklift
+      - mode: exact_path
+        value: /World/Env/Warehouse/Forklift_01
   - group_id: floor_props
     required: true
     root_mode: nearest_xform

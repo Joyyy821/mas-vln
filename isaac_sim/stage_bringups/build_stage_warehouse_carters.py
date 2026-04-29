@@ -12,10 +12,12 @@ Run standalone:
 
 CLI args (preferred):
   --team-config-file /abs/path/to/warehouse_forklift.yaml
+  --scene-usd /abs/path/to/randomized_warehouse_scene.usd
   --output-usd /home/you/.../warehouse_two_robots.usd
 
 Env vars (fallback):
   export CARTER_TEAM_CONFIG_FILE="/abs/path/to/warehouse_forklift.yaml"
+  export CARTER_SCENE_USD="/abs/path/to/randomized_warehouse_scene.usd"
   export OUTPUT_USD="/home/you/.../warehouse_two_robots.usd"
   export CARTER_ROLLOUT_CONTROL_TOPIC="/carters_goal/rollout_control"
   export CARTER_ROLLOUT_RESET_DONE_TOPIC="/carters_goal/rollout_reset_done"
@@ -69,6 +71,7 @@ DEFAULT_TEAM_CONFIG_FILE = os.path.join(
     "warehouse_forklift.yaml",
 )
 ENV_TEAM_CONFIG_FILE = os.environ.get("CARTER_TEAM_CONFIG_FILE", DEFAULT_TEAM_CONFIG_FILE)
+ENV_SCENE_USD = os.environ.get("CARTER_SCENE_USD", "")
 ENV_OUTPUT_USD = os.environ.get("OUTPUT_USD", "")  # optional
 ENV_ROLLOUT_CONTROL_TOPIC = os.environ.get(
     "CARTER_ROLLOUT_CONTROL_TOPIC",
@@ -116,6 +119,14 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--scene-usd",
+        default=ENV_SCENE_USD,
+        help=(
+            "Optional scene USD to open before spawning Carter robots. "
+            "Defaults to CARTER_SCENE_USD when set; otherwise references the built-in warehouse."
+        ),
+    )
+    parser.add_argument(
         "--rollout-control-topic",
         default=ENV_ROLLOUT_CONTROL_TOPIC,
         help="PoseArray topic used by ROS to request rollout resets inside Isaac Sim.",
@@ -132,6 +143,9 @@ def _parse_args():
         raise FileNotFoundError(f"Team config file not found: {team_config_file}")
 
     output_usd = os.path.abspath(os.path.expanduser(args.output_usd)) if args.output_usd else ""
+    scene_usd = os.path.abspath(os.path.expanduser(args.scene_usd)) if args.scene_usd else ""
+    if scene_usd and not os.path.exists(scene_usd):
+        raise FileNotFoundError(f"Scene USD not found: {scene_usd}")
 
     if unknown:
         print(f"[INFO] Ignoring unknown CLI args passed through Isaac Sim: {unknown}")
@@ -139,7 +153,7 @@ def _parse_args():
     rollout_control_topic = str(args.rollout_control_topic).strip()
     rollout_reset_done_topic = str(args.rollout_reset_done_topic).strip()
 
-    return team_config_file, output_usd, rollout_control_topic, rollout_reset_done_topic
+    return team_config_file, output_usd, scene_usd, rollout_control_topic, rollout_reset_done_topic
 
 
 ##########################################
@@ -208,6 +222,41 @@ def _define_xform(path: str):
         from omni.isaac.core.utils.prims import define_prim
 
     define_prim(path, "Xform")
+
+
+def _ensure_xform_path(path: str):
+    if not path or path == "/":
+        return
+    import omni.usd
+
+    current = ""
+    stage = omni.usd.get_context().get_stage()
+    for token in [token for token in path.split("/") if token]:
+        current += f"/{token}"
+        prim = stage.GetPrimAtPath(current)
+        if prim and prim.IsValid():
+            continue
+        _define_xform(current)
+
+
+def _open_stage(stage_usd: str):
+    import omni.usd
+
+    context = omni.usd.get_context()
+    opened = context.open_stage(stage_usd)
+    if opened is False:
+        raise RuntimeError(f"Failed to open scene USD: {stage_usd}")
+
+
+def _clear_prim_children(prim_path: str):
+    import omni.usd
+
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return
+    for child in list(prim.GetChildren()):
+        stage.RemovePrim(child.GetPath())
 
 
 def _set_xform_pose(prim_path: str, position_xyz: Tuple[float, float, float], yaw_deg: float = 0.0):
@@ -754,6 +803,7 @@ class IsaacRolloutResetBridge:
 def build_stage(
     team_config_file: str,
     output_usd: str,
+    scene_usd: str = "",
     enable_ros2: bool = True,
     robot_usd_rel: str | None = None,
 ):
@@ -761,17 +811,24 @@ def build_stage(
     assets_root_path = get_assets_root_path()
     team_config = team_config_utils.load_team_config(team_config_file, maps_dir=MAPS_DIR)
 
-    _new_stage()
-    _set_stage_units(1.0)
+    if scene_usd:
+        _open_stage(scene_usd)
+        _ensure_xform_path("/World")
+        _ensure_xform_path("/World/Robots")
+        _clear_prim_children("/World/Robots")
+        print(f"[OK] Opened environment scene USD: {scene_usd}")
+    else:
+        _new_stage()
+        _set_stage_units(1.0)
 
-    # Create prims
-    _define_xform("/World")
-    _define_xform("/World/Env")
-    _define_xform("/World/Robots")
+        # Create prims
+        _define_xform("/World")
+        _define_xform("/World/Env")
+        _define_xform("/World/Robots")
 
-    # 1) Environment
-    env_prim = "/World/Env/Warehouse"
-    _add_reference(f"{assets_root_path}{ENV_USD_REL}", env_prim)
+        # 1) Environment
+        env_prim = "/World/Env/Warehouse"
+        _add_reference(f"{assets_root_path}{ENV_USD_REL}", env_prim)
 
     # 2) Robots from the shared team config.
     carter_usd_rel = robot_usd_rel or (
@@ -811,8 +868,9 @@ def build_stage(
         print(f"[OK] Saved stage to: {output_usd}")
 
     print(
-        "[OK] Stage built: warehouse + "
-        f"{team_config['agent_num']} robots from {team_config_file} using {carter_usd_rel}"
+        "[OK] Stage built: "
+        f"{scene_usd or 'built-in warehouse'} + {team_config['agent_num']} robots "
+        f"from {team_config_file} using {carter_usd_rel}"
     )
 
     # debug camera topic collisions
@@ -823,7 +881,7 @@ def build_stage(
 
 
 def main():
-    team_config_file, output_usd, rollout_control_topic, rollout_reset_done_topic = _parse_args()
+    team_config_file, output_usd, scene_usd, rollout_control_topic, rollout_reset_done_topic = _parse_args()
     sim_app = _maybe_start_sim_app()
     rollout_reset_bridge = None
     # warm-up updates
@@ -831,7 +889,7 @@ def main():
         sim_app.update()
 
     try:
-        robot_prim_paths = build_stage(team_config_file, output_usd)
+        robot_prim_paths = build_stage(team_config_file, output_usd, scene_usd=scene_usd)
         rollout_reset_bridge = IsaacRolloutResetBridge(
             sim_app=sim_app,
             robot_prim_paths=robot_prim_paths,
