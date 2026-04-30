@@ -3,6 +3,9 @@ description: Moderate geometry-first randomization around the reference warehous
 metadata:
   layout_class: balanced
 
+scene_generation:
+  max_attempts: 10
+
 focus_distance_range_m: [2.5, 4.0]
 
 light_randomizer_overrides:

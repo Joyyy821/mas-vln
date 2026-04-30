@@ -95,6 +95,67 @@ class BuildStageWarehouseRandomizedTests(unittest.TestCase):
             ["scene_1", "scene_2"],
         )
 
+    def test_select_bundle_specs_fills_missing_slot_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scene_root_dir = Path(tmpdir)
+            for scene_number in range(1, 10):
+                bundle_dir = scene_root_dir / f"scene_{scene_number}"
+                bundle_dir.mkdir(parents=True)
+                (bundle_dir / "manifest.yaml").write_text("ok: true\n", encoding="utf-8")
+
+            specs = warehouse_cli.select_bundle_specs_for_run(
+                scene_root_dir=scene_root_dir,
+                available_template_ids=["1", "2", "3"],
+                requested_template_id="2",
+                base_seed=99,
+                scenes_per_template=1,
+                overwrite=False,
+            )
+
+            self.assertEqual([spec.scene_id for spec in specs], ["scene_10"])
+
+    def test_select_bundle_specs_appends_after_highest_existing_scene_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scene_root_dir = Path(tmpdir)
+            for scene_number in range(1, 11):
+                bundle_dir = scene_root_dir / f"scene_{scene_number}"
+                bundle_dir.mkdir(parents=True)
+                (bundle_dir / "manifest.yaml").write_text("ok: true\n", encoding="utf-8")
+
+            specs = warehouse_cli.select_bundle_specs_for_run(
+                scene_root_dir=scene_root_dir,
+                available_template_ids=["1", "2", "3"],
+                requested_template_id="2",
+                base_seed=99,
+                scenes_per_template=1,
+                overwrite=False,
+            )
+
+            self.assertEqual([spec.scene_id for spec in specs], ["scene_11"])
+
+    def test_select_bundle_specs_all_templates_appends_new_scene_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scene_root_dir = Path(tmpdir)
+            for scene_number in range(1, 11):
+                bundle_dir = scene_root_dir / f"scene_{scene_number}"
+                bundle_dir.mkdir(parents=True)
+                (bundle_dir / "manifest.yaml").write_text("ok: true\n", encoding="utf-8")
+
+            specs = warehouse_cli.select_bundle_specs_for_run(
+                scene_root_dir=scene_root_dir,
+                available_template_ids=["1", "2", "3"],
+                all_template=True,
+                base_seed=99,
+                scenes_per_template=1,
+                overwrite=False,
+            )
+
+            self.assertEqual(
+                [spec.scene_id for spec in specs],
+                ["scene_11", "scene_12", "scene_13"],
+            )
+            self.assertEqual([spec.template_id for spec in specs], ["1", "2", "3"])
+
     def test_parse_selected_variant_ids_supports_base_only_shortcut(self) -> None:
         variant_ids = warehouse_cli._parse_selected_variant_ids(
             variants=[],
@@ -132,10 +193,108 @@ class BuildStageWarehouseRandomizedTests(unittest.TestCase):
         second_seed = warehouse_cli._derive_bundle_seed(42, "1", "balanced")
         open_seed = warehouse_cli._derive_bundle_seed(42, "1", "open")
         second_scene_seed = warehouse_cli._derive_bundle_seed(42, "1", "balanced", 2)
+        retry_seed = warehouse_cli._derive_bundle_seed(42, "1", "balanced", 1, 2)
 
         self.assertEqual(first_seed, second_seed)
         self.assertNotEqual(first_seed, open_seed)
         self.assertNotEqual(first_seed, second_scene_seed)
+        self.assertNotEqual(first_seed, retry_seed)
+
+    def test_build_scene_bundle_with_retries_resamples_seed(self) -> None:
+        calls = []
+        original_build_scene_bundle = warehouse_cli._build_scene_bundle
+
+        def fake_build_scene_bundle(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("placement failed")
+            return object(), "sim_app"
+
+        warehouse_cli._build_scene_bundle = fake_build_scene_bundle
+        try:
+            spec = warehouse_cli.BundleBuildSpec(
+                template_id="2",
+                variant_id="balanced",
+                scene_id="scene_10",
+                seed=1,
+                template_scene_index=5,
+                scene_number=10,
+            )
+
+            result, sim_app, failure = warehouse_cli._build_scene_bundle_with_retries(
+                bundle_spec=spec,
+                base_seed=99,
+                max_scene_attempts=2,
+                template=object(),
+                scene_root_dir=Path("/tmp/randomized_warehouse_test"),
+                robot_models=["nova_carter"],
+                robot_count=3,
+                rollout_count=5,
+                language_instruction="go to the forklift near the shelf",
+                enable_ros2_runtime=False,
+                rollout_control_topic="/control",
+                rollout_reset_done_topic="/done",
+                overwrite=False,
+                headless=True,
+                keep_sim_running=False,
+                scene_only=True,
+            )
+        finally:
+            warehouse_cli._build_scene_bundle = original_build_scene_bundle
+
+        self.assertIsNotNone(result)
+        self.assertEqual(sim_app, "sim_app")
+        self.assertIsNone(failure)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(calls[0]["overwrite"])
+        self.assertTrue(calls[1]["overwrite"])
+        self.assertNotEqual(calls[0]["seed"], calls[1]["seed"])
+
+    def test_build_scene_bundle_with_retries_returns_failure_after_budget(self) -> None:
+        calls = []
+        original_build_scene_bundle = warehouse_cli._build_scene_bundle
+
+        def fake_build_scene_bundle(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("still blocked")
+
+        warehouse_cli._build_scene_bundle = fake_build_scene_bundle
+        try:
+            spec = warehouse_cli.BundleBuildSpec(
+                template_id="2",
+                variant_id="balanced",
+                scene_id="scene_10",
+                seed=1,
+                template_scene_index=5,
+                scene_number=10,
+            )
+
+            result, sim_app, failure = warehouse_cli._build_scene_bundle_with_retries(
+                bundle_spec=spec,
+                base_seed=99,
+                max_scene_attempts=2,
+                template=object(),
+                scene_root_dir=Path("/tmp/randomized_warehouse_test"),
+                robot_models=["nova_carter"],
+                robot_count=3,
+                rollout_count=5,
+                language_instruction="go to the forklift near the shelf",
+                enable_ros2_runtime=False,
+                rollout_control_topic="/control",
+                rollout_reset_done_topic="/done",
+                overwrite=False,
+                headless=True,
+                keep_sim_running=False,
+                scene_only=True,
+            )
+        finally:
+            warehouse_cli._build_scene_bundle = original_build_scene_bundle
+
+        self.assertIsNone(result)
+        self.assertIsNone(sim_app)
+        self.assertIsNotNone(failure)
+        self.assertEqual(len(failure.attempts), 2)
+        self.assertEqual(len(calls), 2)
 
     def test_collection_metadata_payload_uses_instruction_selector_contract(self) -> None:
         payload = warehouse_cli.build_collection_metadata_payload(

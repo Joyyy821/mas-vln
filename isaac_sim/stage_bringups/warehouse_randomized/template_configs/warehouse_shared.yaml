@@ -9,6 +9,9 @@ metadata:
   template_family: warehouse_randomized_v2
   starter_template: true
 
+scene_generation:
+  max_attempts: 10
+
 nav2_map:
   resolution_m: 0.05
   origin_hint_xyz: [-11.975, -17.975, 0.0]

@@ -14,6 +14,7 @@ DEFAULT_SHARED_TEMPLATE_CONFIG_BASENAME = "warehouse_shared.yaml"
 DEFAULT_RANDOMIZATION_VARIANT_IDS = ("balanced", "messy", "open")
 DEFAULT_BASE_VARIANT_ID = "base"
 DEFAULT_VARIANT_IDS = (DEFAULT_BASE_VARIANT_ID,) + DEFAULT_RANDOMIZATION_VARIANT_IDS
+DEFAULT_SCENE_GENERATION_MAX_ATTEMPTS = 10
 
 
 def _as_float_tuple(values: Sequence[float], *, length: int, field_name: str) -> tuple[float, ...]:
@@ -42,6 +43,21 @@ def _as_rgb_range(
     for index, channel_range in enumerate(values):
         channels.append(_as_range_tuple(channel_range, field_name=f"{field_name}[{index}]"))
     return (channels[0], channels[1], channels[2])
+
+
+def _parse_scene_generation_max_attempts(
+    raw_value: Mapping[str, Any] | None,
+    *,
+    field_name: str,
+) -> int:
+    if not raw_value:
+        return DEFAULT_SCENE_GENERATION_MAX_ATTEMPTS
+    if not isinstance(raw_value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping.")
+    max_attempts = int(raw_value.get("max_attempts", DEFAULT_SCENE_GENERATION_MAX_ATTEMPTS))
+    if max_attempts <= 0:
+        raise ValueError(f"{field_name}.max_attempts must be positive, got {max_attempts}.")
+    return max_attempts
 
 
 def _path_list(paths: Iterable[str | Path]) -> list[Path]:
@@ -201,6 +217,7 @@ class WarehouseTemplate:
     focus_group_names: tuple[str, ...]
     focus_distance_range_m: tuple[float, float]
     metadata: dict[str, Any]
+    scene_generation_max_attempts: int = DEFAULT_SCENE_GENERATION_MAX_ATTEMPTS
 
     @property
     def template_config_path(self) -> Path:
@@ -254,6 +271,7 @@ class WarehouseRandomizationPreset:
     light_randomizer_overrides: dict[str, dict[str, Any]]
     object_randomizer_overrides: dict[str, dict[str, Any]]
     metadata: dict[str, Any]
+    scene_generation_overrides: dict[str, Any] = field(default_factory=dict)
 
 
 def _parse_selectors(raw_value: Sequence[Any] | None, *, field_name: str) -> tuple[SelectorSpec, ...]:
@@ -528,6 +546,10 @@ def _warehouse_template_from_payload(
             payload.get("focus_distance_range_m", (2.5, 5.25)),
             field_name="focus_distance_range_m",
         ),
+        scene_generation_max_attempts=_parse_scene_generation_max_attempts(
+            payload.get("scene_generation"),
+            field_name="scene_generation",
+        ),
         metadata=dict(payload.get("metadata", {}) or {}),
     )
 
@@ -699,6 +721,9 @@ def load_randomization_presets(
                 raise ValueError(
                     f"{resolved_path}: '{DEFAULT_BASE_VARIANT_ID}' is built-in and must not be defined as a preset."
                 )
+            scene_generation_overrides = payload.get("scene_generation", {}) or {}
+            if not isinstance(scene_generation_overrides, Mapping):
+                raise ValueError(f"{resolved_path}: scene_generation must be a mapping.")
             presets[variant_id] = WarehouseRandomizationPreset(
                 variant_id=variant_id,
                 description=str(payload.get("description", "")).strip(),
@@ -711,6 +736,7 @@ def load_randomization_presets(
                         field_name=f"{resolved_path}.focus_distance_range_m",
                     )
                 ),
+                scene_generation_overrides=dict(scene_generation_overrides),
                 light_randomizer_overrides=_parse_named_override_map(
                     payload.get("light_randomizer_overrides"),
                     field_name=f"{resolved_path}.light_randomizer_overrides",
@@ -789,6 +815,11 @@ def compose_warehouse_template(
         )
         if preset.focus_distance_range_m is not None:
             payload["focus_distance_range_m"] = list(preset.focus_distance_range_m)
+        if preset.scene_generation_overrides:
+            payload["scene_generation"] = _merge_dicts(
+                dict(payload.get("scene_generation", {}) or {}),
+                preset.scene_generation_overrides,
+            )
 
     metadata = dict(payload.get("metadata", {}) or {})
     metadata["variant_id"] = variant_id

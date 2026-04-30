@@ -25,6 +25,9 @@ def _shared_defaults_payload() -> dict:
         "metadata": {
             "template_family": "warehouse_randomized_test",
         },
+        "scene_generation": {
+            "max_attempts": 7,
+        },
         "nav2_map": {
             "resolution_m": 0.05,
             "origin_hint_xyz": [0.0, 0.0, 0.0],
@@ -129,6 +132,9 @@ def _open_preset_payload() -> dict:
             "layout_class": "open",
         },
         "focus_distance_range_m": [3.0, 6.0],
+        "scene_generation": {
+            "max_attempts": 3,
+        },
         "light_randomizer_overrides": {
             "warehouse_lights": {
                 "intensity_range": [250.0, 300.0],
@@ -174,6 +180,7 @@ class WarehouseRandomizedTemplateTests(unittest.TestCase):
         }
         self.assertIn("/World/Env/Warehouse/Forklift", focus_paths)
         self.assertIn("/World/Env/Warehouse/Forklift_01", focus_paths)
+        self.assertEqual(payload["scene_generation"]["max_attempts"], 10)
 
         for zone in payload["placement_zones"]:
             self.assertGreaterEqual(zone["min_xyz"][0], -10.0)
@@ -249,6 +256,7 @@ class WarehouseRandomizedTemplateTests(unittest.TestCase):
             self.assertFalse(open_template.nav2_map.include_outer_bounds_perimeter)
             self.assertFalse(open_template.mapf_map.include_outer_bounds_perimeter)
             self.assertEqual(open_template.metadata["layout_class"], "open")
+            self.assertEqual(open_template.scene_generation_max_attempts, 3)
 
             randomizer_names = [randomizer.name for randomizer in open_template.object_randomizers]
             self.assertEqual(randomizer_names, ["appearance_props_colors", "forklift_layout"])
@@ -268,6 +276,7 @@ class WarehouseRandomizedTemplateTests(unittest.TestCase):
             self.assertEqual(base_template.preset_config_path, None)
             self.assertEqual(base_template.light_randomizers, ())
             self.assertEqual(base_template.object_randomizers, ())
+            self.assertEqual(base_template.scene_generation_max_attempts, 7)
 
 
 if __name__ == "__main__":

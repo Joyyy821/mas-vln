@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import os
 from pathlib import Path
+import re
 import sys
 import time
 import traceback
@@ -56,6 +57,21 @@ class BundleBuildSpec:
     seed: int
     template_scene_index: int
     scene_number: int
+
+
+@dataclass(frozen=True)
+class FailedSceneAttempt:
+    attempt_index: int
+    seed: int
+    exception_type: str
+    exception_message: str
+
+
+@dataclass(frozen=True)
+class FailedSceneSpec:
+    spec: BundleBuildSpec
+    attempts: tuple[FailedSceneAttempt, ...]
+    failure_snapshot_path: Path
 
 
 def _load_builder_class():
@@ -121,13 +137,15 @@ def _derive_bundle_seed(
     template_id: str,
     variant_id: str,
     template_scene_index: int = 1,
+    attempt_index: int = 1,
 ) -> int:
-    digest = hashlib.sha256(
-        (
-            f"{int(base_seed)}::{str(template_id).strip()}::"
-            f"{str(variant_id).strip()}::{int(template_scene_index)}"
-        ).encode("utf-8")
-    ).digest()
+    seed_material = (
+        f"{int(base_seed)}::{str(template_id).strip()}::"
+        f"{str(variant_id).strip()}::{int(template_scene_index)}"
+    )
+    if int(attempt_index) > 1:
+        seed_material = f"{seed_material}::{int(attempt_index)}"
+    digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
     derived_seed = int.from_bytes(digest[:8], "big") % (2**31 - 1)
     return derived_seed or 1
 
@@ -208,7 +226,10 @@ def plan_bundle_specs(
     randomization_strength: str = DEFAULT_RANDOMIZATION_STRENGTH,
     scenes_per_template: int = DEFAULT_SCENES_PER_TEMPLATE,
 ) -> list[BundleBuildSpec]:
-    available_ids = sorted({str(value).strip() for value in available_template_ids if str(value).strip()}, key=_template_sort_key)
+    available_ids = sorted(
+        {str(value).strip() for value in available_template_ids if str(value).strip()},
+        key=_template_sort_key,
+    )
     if not available_ids:
         raise ValueError("No template ids are available for planning.")
     if all_template and str(scene_id_prefix).strip():
@@ -251,6 +272,117 @@ def plan_bundle_specs(
                 )
             )
     return specs
+
+
+def _scene_bundle_dir(scene_root_dir: Path, scene_id: str) -> Path:
+    return Path(scene_root_dir).expanduser().resolve() / str(scene_id)
+
+
+def _selected_template_ids(
+    *,
+    available_template_ids: list[str],
+    requested_template_id: str = "",
+    all_template: bool = False,
+    scene_id_prefix: str = "",
+) -> list[str]:
+    available_ids = sorted(
+        {str(value).strip() for value in available_template_ids if str(value).strip()},
+        key=_template_sort_key,
+    )
+    if not available_ids:
+        raise ValueError("No template ids are available for planning.")
+    if all_template and str(scene_id_prefix).strip():
+        raise ValueError("--scene-id cannot be used together with --all_template.")
+
+    clean_requested_template_id = str(requested_template_id).strip()
+    if all_template:
+        return available_ids
+    if not clean_requested_template_id:
+        clean_requested_template_id = available_ids[0]
+    if clean_requested_template_id not in set(available_ids):
+        raise ValueError(
+            f"Unknown template_id '{clean_requested_template_id}'. Available templates: {available_ids}"
+        )
+    return [clean_requested_template_id]
+
+
+def _existing_scene_numbers(scene_root_dir: Path, scene_id_prefix: str = "") -> list[int]:
+    scene_root = Path(scene_root_dir).expanduser().resolve()
+    if not scene_root.exists():
+        return []
+
+    clean_prefix = str(scene_id_prefix).strip()
+    if clean_prefix:
+        pattern = re.compile(rf"^{re.escape(clean_prefix)}_scene_(\d+)$")
+    else:
+        pattern = re.compile(r"^scene_(\d+)$")
+
+    scene_numbers: list[int] = []
+    for path in scene_root.iterdir():
+        if not path.is_dir():
+            continue
+        match = pattern.fullmatch(path.name)
+        if match is not None:
+            scene_numbers.append(int(match.group(1)))
+    return sorted(scene_numbers)
+
+
+def select_bundle_specs_for_run(
+    *,
+    scene_root_dir: Path,
+    available_template_ids: list[str],
+    requested_template_id: str = "",
+    all_template: bool = False,
+    scene_id_prefix: str = "",
+    base_seed: int,
+    randomization_strength: str = DEFAULT_RANDOMIZATION_STRENGTH,
+    scenes_per_template: int = DEFAULT_SCENES_PER_TEMPLATE,
+    overwrite: bool = False,
+) -> list[BundleBuildSpec]:
+    requested_count = int(scenes_per_template)
+    if requested_count <= 0:
+        raise ValueError(f"scenes_per_template must be positive, got {scenes_per_template}.")
+    selected_template_ids = _selected_template_ids(
+        available_template_ids=available_template_ids,
+        requested_template_id=requested_template_id,
+        all_template=all_template,
+        scene_id_prefix=scene_id_prefix,
+    )
+    if overwrite:
+        return plan_bundle_specs(
+            available_template_ids=available_template_ids,
+            requested_template_id=requested_template_id,
+            all_template=all_template,
+            scene_id_prefix=scene_id_prefix,
+            base_seed=base_seed,
+            randomization_strength=randomization_strength,
+            scenes_per_template=requested_count,
+        )
+
+    clean_strength = str(randomization_strength).strip() or DEFAULT_RANDOMIZATION_STRENGTH
+    selected_variant_id = _normalize_variant_ids((clean_strength,))[0]
+    next_scene_number = max(_existing_scene_numbers(scene_root_dir, scene_id_prefix), default=0) + 1
+    selected: list[BundleBuildSpec] = []
+    for template_id in selected_template_ids:
+        for _ in range(requested_count):
+            scene_number = next_scene_number
+            next_scene_number += 1
+            selected.append(
+                BundleBuildSpec(
+                    template_id=template_id,
+                    variant_id=selected_variant_id,
+                    scene_id=_build_scene_id(scene_number, scene_id_prefix),
+                    seed=_derive_bundle_seed(
+                        base_seed,
+                        template_id,
+                        selected_variant_id,
+                        scene_number,
+                    ),
+                    template_scene_index=scene_number,
+                    scene_number=scene_number,
+                )
+            )
+    return selected
 
 
 def _parse_args() -> argparse.Namespace:
@@ -297,10 +429,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scenes-per-template",
+        "--scene-per-template",
+        "--scene-per-id",
+        dest="scenes_per_template",
         type=int,
         default=DEFAULT_SCENES_PER_TEMPLATE,
         help=(
-            "Number of randomized scenes to generate per selected manual template. "
+            "Number of new randomized scenes to generate per selected manual template. "
             f"Defaults to {DEFAULT_SCENES_PER_TEMPLATE}."
         ),
     )
@@ -506,10 +641,110 @@ def _build_scene_bundle(
             return result, active_sim_app
         _close_runtime(result, active_sim_app)
         return result, None
-    except Exception:
+    except Exception as exc:
         if close_sim_app_when_done:
             _close_runtime(result, active_sim_app)
+        else:
+            setattr(exc, "_randomized_warehouse_sim_app", active_sim_app)
         raise
+
+
+def _build_scene_bundle_with_retries(
+    *,
+    bundle_spec: BundleBuildSpec,
+    base_seed: int,
+    max_scene_attempts: int,
+    template: WarehouseTemplate,
+    scene_root_dir: Path,
+    robot_models: list[str],
+    robot_count: int,
+    rollout_count: int,
+    language_instruction: str,
+    enable_ros2_runtime: bool,
+    rollout_control_topic: str,
+    rollout_reset_done_topic: str,
+    overwrite: bool,
+    headless: bool,
+    keep_sim_running: bool,
+    sim_app=None,
+    scene_only: bool = False,
+    spawn_robots_only: bool = False,
+):
+    attempts: list[FailedSceneAttempt] = []
+    attempt_budget = max(1, int(max_scene_attempts))
+
+    for attempt_index in range(1, attempt_budget + 1):
+        attempt_seed = _derive_bundle_seed(
+            base_seed,
+            bundle_spec.template_id,
+            bundle_spec.variant_id,
+            bundle_spec.template_scene_index,
+            attempt_index,
+        )
+        attempt_spec = replace(bundle_spec, seed=attempt_seed)
+        attempt_overwrite = bool(overwrite) or attempt_index > 1
+        if attempt_index > 1:
+            print(
+                f"[INFO] Retrying {bundle_spec.scene_id} "
+                f"(attempt {attempt_index}/{attempt_budget}, seed={attempt_seed}).",
+                flush=True,
+            )
+        try:
+            result, active_sim_app = _build_scene_bundle(
+                template=template,
+                scene_root_dir=scene_root_dir,
+                scene_id=attempt_spec.scene_id,
+                seed=attempt_spec.seed,
+                robot_models=robot_models,
+                robot_count=robot_count,
+                rollout_count=rollout_count,
+                language_instruction=language_instruction,
+                enable_ros2_runtime=enable_ros2_runtime,
+                rollout_control_topic=rollout_control_topic,
+                rollout_reset_done_topic=rollout_reset_done_topic,
+                overwrite=attempt_overwrite,
+                headless=headless,
+                keep_sim_running=keep_sim_running,
+                sim_app=sim_app,
+                close_sim_app_when_done=False,
+                scene_only=scene_only,
+                spawn_robots_only=spawn_robots_only,
+            )
+            if attempts:
+                print(
+                    f"[OK] {bundle_spec.scene_id} succeeded after {attempt_index} attempts.",
+                    flush=True,
+                )
+            return result, active_sim_app, None
+        except Exception as exc:
+            failed_sim_app = getattr(exc, "_randomized_warehouse_sim_app", None)
+            if failed_sim_app is not None:
+                sim_app = failed_sim_app
+            attempts.append(
+                FailedSceneAttempt(
+                    attempt_index=attempt_index,
+                    seed=attempt_seed,
+                    exception_type=type(exc).__name__,
+                    exception_message=str(exc),
+                )
+            )
+            print(
+                f"[WARN] {bundle_spec.scene_id} attempt {attempt_index}/{attempt_budget} failed: {exc}",
+                flush=True,
+            )
+
+    failure = FailedSceneSpec(
+        spec=bundle_spec,
+        attempts=tuple(attempts),
+        failure_snapshot_path=(
+            _scene_bundle_dir(scene_root_dir, bundle_spec.scene_id) / "build_failure_snapshot.yaml"
+        ),
+    )
+    print(
+        f"[ERROR] Skipping {bundle_spec.scene_id} after {attempt_budget} failed attempts.",
+        flush=True,
+    )
+    return None, sim_app, failure
 
 
 def _print_bundle_result(result) -> None:
@@ -534,6 +769,38 @@ def _print_bundle_result(result) -> None:
             f"team_config_file:={result.team_config_path} experiments_dir:={result.rollouts_dir}",
             flush=True,
         )
+
+
+def _print_batch_summary(
+    *,
+    successful_results: list,
+    failed_scenes: list[FailedSceneSpec],
+) -> None:
+    print("[SUMMARY] Randomized warehouse batch complete.", flush=True)
+    print(f"  generated: {len(successful_results)}", flush=True)
+    print(f"  failed: {len(failed_scenes)}", flush=True)
+    if failed_scenes:
+        print("  unsuccessful scene bundles:", flush=True)
+        for failure in failed_scenes:
+            last_attempt = failure.attempts[-1] if failure.attempts else None
+            if last_attempt is None:
+                print(
+                    f"    - {failure.spec.scene_id} "
+                    f"(template={failure.spec.template_id}, attempts=0)",
+                    flush=True,
+                )
+                continue
+            print(
+                f"    - {failure.spec.scene_id} "
+                f"(template={failure.spec.template_id}, attempts={len(failure.attempts)}, "
+                f"last_seed={last_attempt.seed}, snapshot={failure.failure_snapshot_path})",
+                flush=True,
+            )
+            print(
+                f"      last_error: {last_attempt.exception_type}: "
+                f"{last_attempt.exception_message}",
+                flush=True,
+            )
 
 
 def main() -> int:
@@ -606,7 +873,8 @@ def main() -> int:
     robot_models = _parse_robot_models(args.robot_models)
 
     try:
-        bundle_specs = plan_bundle_specs(
+        bundle_specs = select_bundle_specs_for_run(
+            scene_root_dir=scene_root_dir,
             available_template_ids=template_ids,
             requested_template_id=args.template_id,
             all_template=bool(args.all_template),
@@ -614,10 +882,19 @@ def main() -> int:
             base_seed=base_seed,
             randomization_strength=selected_randomization_strength,
             scenes_per_template=int(args.scenes_per_template),
+            overwrite=bool(args.overwrite) or bool(args.spawn_robots_only),
         )
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 2
+
+    if not bundle_specs:
+        _write_collection_metadata(scene_root_dir, language_instruction)
+        _print_batch_summary(
+            successful_results=[],
+            failed_scenes=[],
+        )
+        return 0
 
     if run_sim and len(bundle_specs) > 1:
         final_spec = bundle_specs[-1]
@@ -634,6 +911,8 @@ def main() -> int:
 
     _write_collection_metadata(scene_root_dir, language_instruction)
     final_result = None
+    successful_results = []
+    failed_scenes: list[FailedSceneSpec] = []
     shared_sim_app = None
     shared_headless = requested_headless
     try:
@@ -651,11 +930,12 @@ def main() -> int:
             )
             is_final_bundle = index == (len(bundle_specs) - 1)
             keep_sim_running = is_final_bundle and run_sim
-            result, sim_app = _build_scene_bundle(
+            result, sim_app, failure = _build_scene_bundle_with_retries(
+                bundle_spec=bundle_spec,
+                base_seed=base_seed,
+                max_scene_attempts=template.scene_generation_max_attempts,
                 template=template,
                 scene_root_dir=scene_root_dir,
-                scene_id=bundle_spec.scene_id,
-                seed=bundle_spec.seed,
                 robot_models=robot_models,
                 robot_count=int(args.robot_count),
                 rollout_count=int(args.rollout_count),
@@ -667,18 +947,26 @@ def main() -> int:
                 headless=shared_headless,
                 keep_sim_running=keep_sim_running,
                 sim_app=shared_sim_app,
-                close_sim_app_when_done=False,
                 scene_only=bool(args.scene_only),
                 spawn_robots_only=bool(args.spawn_robots_only),
             )
+            if failure is not None:
+                shared_sim_app = sim_app
+                failed_scenes.append(failure)
+                continue
             _print_bundle_result(result)
+            successful_results.append(result)
             shared_sim_app = sim_app
             if is_final_bundle:
                 final_result = result
 
         if run_sim and shared_sim_app is not None and final_result is not None:
             _run_interactive_loop(shared_sim_app, final_result.ros_bridge)
-        return 0
+        _print_batch_summary(
+            successful_results=successful_results,
+            failed_scenes=failed_scenes,
+        )
+        return 1 if failed_scenes else 0
     except Exception:
         traceback.print_exc()
         return 1
