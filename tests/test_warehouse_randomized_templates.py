@@ -181,6 +181,12 @@ class WarehouseRandomizedTemplateTests(unittest.TestCase):
         self.assertIn("/World/Env/Warehouse/Forklift", focus_paths)
         self.assertIn("/World/Env/Warehouse/Forklift_01", focus_paths)
         self.assertEqual(payload["scene_generation"]["max_attempts"], 10)
+        self.assertEqual(payload["robot_team"]["mode"], "heterogeneous_priority_v1")
+        self.assertEqual(payload["robot_team"]["count_distribution"], {2: 0.2, 3: 0.5, 4: 0.3})
+        self.assertEqual(
+            payload["robot_team"]["model_priority"],
+            ["nova_carter", "carter_v1", "jackal", "limo"],
+        )
 
         for zone in payload["placement_zones"]:
             self.assertGreaterEqual(zone["min_xyz"][0], -10.0)

@@ -168,6 +168,7 @@ def _normalize_robots_config(robots_config: Any, source_label: str) -> list[dict
         if name in seen_names:
             raise ValueError(f"Robot name '{name}' is duplicated in {source_label}.")
         seen_names.add(name)
+        model = str(robot_config.get("model", "") or "").strip()
 
         initial_pose = pose_config_to_list(
             robot_config.get("initial_pose", robot_config.get("start_pose")),
@@ -181,6 +182,7 @@ def _normalize_robots_config(robots_config: Any, source_label: str) -> list[dict
         robots.append(
             {
                 "name": name,
+                "model": model,
                 "initial_pose": initial_pose,
                 "goal_pose": goal_pose,
             }
@@ -253,7 +255,6 @@ def load_multi_rollout_config(team_config_path: str, maps_dir: str | None = None
                 f"'rollouts' in {team_config_path} must be a non-empty list when provided."
             )
 
-        canonical_robot_names: list[str] | None = None
         seen_rollout_ids: set[int] = set()
         for rollout_index, rollout_config in enumerate(raw_rollouts):
             if not isinstance(rollout_config, dict):
@@ -276,19 +277,6 @@ def load_multi_rollout_config(team_config_path: str, maps_dir: str | None = None
                 rollout_config.get("robots", []),
                 f"{team_config_path}.rollouts[{rollout_index}]",
             )
-            rollout_robot_names = [robot["name"] for robot in robots]
-            if canonical_robot_names is None:
-                canonical_robot_names = rollout_robot_names
-            else:
-                if set(rollout_robot_names) != set(canonical_robot_names):
-                    raise ValueError(
-                        "Every rollout must define the same robot namespaces. "
-                        f"Expected {canonical_robot_names}, got {rollout_robot_names} in "
-                        f"{team_config_path}.rollouts[{rollout_index}]."
-                    )
-                robot_by_name = {robot["name"]: robot for robot in robots}
-                robots = [robot_by_name[name] for name in canonical_robot_names]
-
             canonical_rollouts.append(
                 _rollout_payload(
                     rollout_id=rollout_id,
@@ -298,6 +286,12 @@ def load_multi_rollout_config(team_config_path: str, maps_dir: str | None = None
             )
 
     first_rollout = canonical_rollouts[0]
+    rollout_namespaces = [
+        [robot["name"] for robot in rollout["robots"]]
+        for rollout in canonical_rollouts
+    ]
+    rollout_agent_counts = [len(rollout["robots"]) for rollout in canonical_rollouts]
+    first_namespaces = rollout_namespaces[0]
 
     return {
         "team_config_path": team_config_path,
@@ -305,7 +299,13 @@ def load_multi_rollout_config(team_config_path: str, maps_dir: str | None = None
         "environment": environment,
         "rollouts": canonical_rollouts,
         "rollout_ids": [rollout["id"] for rollout in canonical_rollouts],
-        "robot_namespaces": [robot["name"] for robot in first_rollout["robots"]],
+        "robot_namespaces": first_namespaces,
+        "rollout_robot_namespaces": rollout_namespaces,
+        "rollout_agent_counts": rollout_agent_counts,
+        "variable_agent_count": len(set(rollout_agent_counts)) > 1,
+        "variable_robot_namespaces": any(
+            namespaces != first_namespaces for namespaces in rollout_namespaces[1:]
+        ),
         "agent_num": len(first_rollout["robots"]),
         "nav2_map": nav2_map,
         "mapf_map": mapf_map,
@@ -345,6 +345,9 @@ def load_team_config(
         "rollout_id": selected_rollout["id"],
         "rollout_index": selected_rollout["rollout_index"],
         "robots": selected_rollout["robots"],
+        "robot_namespaces": [robot["name"] for robot in selected_rollout["robots"]],
+        "robot_models": [robot.get("model", "") for robot in selected_rollout["robots"]],
+        "agent_num": len(selected_rollout["robots"]),
         "initial_pose_array": selected_rollout["initial_pose_array"],
         "goal_pose_array": selected_rollout["goal_pose_array"],
     }

@@ -39,6 +39,13 @@ from isaac_sim.stage_bringups.warehouse_randomized.robots import (
     RuntimeRobotController,
     build_robot_adapter,
 )
+from isaac_sim.stage_bringups.warehouse_randomized.robot_teams import (
+    DEFAULT_ROBOT_TEAM_MODE,
+    RobotTeamPolicy,
+    build_fixed_robot_team,
+    robot_team_policy_payload,
+    sample_priority_robot_team,
+)
 from isaac_sim.stage_bringups.warehouse_randomized.ros_bridge import InternalIsaacRosBridge
 from isaac_sim.stage_bringups.warehouse_randomized.templates import (
     KeepoutZone,
@@ -54,7 +61,6 @@ OMAP_EXTENSION_NAME = "isaacsim.asset.gen.omap"
 OMAP_DEFAULT_Z_MIN = 0.1
 OMAP_DEFAULT_Z_MAX = 0.62
 OMAP_PHYSICS_WARMUP_UPDATES = 120
-DEFAULT_ROBOT_TEAM_MODE = "three_nova_carter_v1"
 ROS_COSTMAP_PARAMS_RELS = (
     Path("ros2_ws/src/carters_goal/config/mapf_costmap_params_isaac.yaml"),
     Path("ros2_ws/src/carters_nav2/config/warehouse/multi_robot_carter_rpp_controller_only_params.yaml"),
@@ -121,8 +127,6 @@ class RandomizedWarehouseBuilder:
         if self._scene_only and self._spawn_robots_only:
             raise ValueError("scene_only and spawn_robots_only cannot both be true.")
 
-        if self._robot_count < 2 or self._robot_count > 5:
-            raise ValueError(f"robot_count must be between 2 and 5, got {self._robot_count}.")
         if self._rollout_count <= 0:
             raise ValueError("rollout_count must be positive.")
 
@@ -131,17 +135,27 @@ class RandomizedWarehouseBuilder:
         self._template = template
 
         expanded_models = [str(model).strip() for model in robot_models if str(model).strip()]
-        if not expanded_models:
-            expanded_models = ["nova_carter"]
-        if len(expanded_models) == 1:
-            expanded_models = expanded_models * self._robot_count
-        if len(expanded_models) != self._robot_count:
-            raise ValueError(
-                "robot_models must contain either one model or exactly robot_count models."
+        self._robot_team_policy: RobotTeamPolicy = template.robot_team
+        self._fixed_robot_team: list[dict[str, str]] | None = None
+        if expanded_models or self._robot_count > 0:
+            if self._robot_count <= 0:
+                self._robot_count = len(expanded_models)
+            if self._robot_count < 2 or self._robot_count > 5:
+                raise ValueError(f"robot_count must be between 2 and 5, got {self._robot_count}.")
+            self._fixed_robot_team = build_fixed_robot_team(
+                model_ids=expanded_models,
+                robot_count=self._robot_count,
             )
-
-        self._robot_names = [f"robot{index}" for index in range(1, self._robot_count + 1)]
-        self._robot_adapters = [build_robot_adapter(model_id) for model_id in expanded_models]
+            self._robot_names = [member["name"] for member in self._fixed_robot_team]
+            self._robot_adapters = [
+                build_robot_adapter(member["model"]) for member in self._fixed_robot_team
+            ]
+        else:
+            self._robot_count = 0
+            self._robot_names = []
+            self._robot_adapters = [
+                build_robot_adapter(model_id) for model_id in self._robot_team_policy.model_priority
+            ]
 
         self._sim_app = sim_app
         self._bundle_dir = self._scene_root_dir / self._scene_id
@@ -171,6 +185,7 @@ class RandomizedWarehouseBuilder:
         self._focus_object: ObjectBBox3D | None = None
         self._focus_selection_debug: dict[str, Any] = {}
         self._rollouts_payload: list[dict[str, Any]] = []
+        self._rollout_robot_teams: list[list[dict[str, str]]] = []
         self._sampling_validation: dict[str, Any] = {}
         self._robot_prim_paths: list[str] = []
         self._robot_controllers: list[RuntimeRobotController] = []
@@ -194,6 +209,65 @@ class RandomizedWarehouseBuilder:
             enable_ros2_bridge=self._enable_ros2_runtime,
             extra_extensions=(OMAP_EXTENSION_NAME,),
         )
+
+    def _robot_team_policy_payload(self) -> dict[str, Any]:
+        return robot_team_policy_payload(getattr(self, "_robot_team_policy", self._template.robot_team))
+
+    def _active_robot_team_mode(self) -> str:
+        if getattr(self, "_fixed_robot_team", None) is not None:
+            return "fixed_robot_team_debug"
+        return getattr(self, "_robot_team_policy", self._template.robot_team).mode
+
+    def _activate_robot_team(self, robot_team: list[dict[str, str]]) -> None:
+        self._robot_names = [str(member["name"]) for member in robot_team]
+        self._robot_adapters = [build_robot_adapter(member["model"]) for member in robot_team]
+        self._robot_count = len(robot_team)
+
+    def _rollout_team_from_robots(
+        self,
+        robots: list[dict[str, Any]],
+        *,
+        fallback_models: list[str] | None = None,
+        fallback_model: str = "nova_carter",
+    ) -> list[dict[str, str]]:
+        fallback_models = list(fallback_models or [])
+        team: list[dict[str, str]] = []
+        for index, robot in enumerate(robots):
+            model = str(robot.get("model", "") or "").strip()
+            if not model and index < len(fallback_models):
+                model = str(fallback_models[index]).strip()
+            if not model:
+                model = fallback_model
+            name = str(robot.get("name", "") or "").strip() or model
+            team.append({"name": name, "model": model})
+            robot["name"] = name
+            robot["model"] = model
+        return team
+
+    def _sample_rollout_robot_teams(self) -> list[list[dict[str, str]]]:
+        if self._fixed_robot_team is not None:
+            return [
+                [dict(member) for member in self._fixed_robot_team]
+                for _ in range(self._rollout_count)
+            ]
+        return [
+            sample_priority_robot_team(policy=self._robot_team_policy, rng=self._rng)
+            for _ in range(self._rollout_count)
+        ]
+
+    def _robot_model_ids_for_manifest(self) -> list[str]:
+        fixed_team = getattr(self, "_fixed_robot_team", None)
+        if fixed_team is not None:
+            return [member["model"] for member in fixed_team]
+        policy = getattr(self, "_robot_team_policy", self._template.robot_team)
+        return list(policy.model_priority)
+
+    def _prim_name_for_robot(self, *, robot_name: str, model_id: str, index: int) -> str:
+        clean = re.sub(r"[^A-Za-z0-9_]+", "_", str(robot_name).strip())
+        clean = clean.strip("_")
+        if clean:
+            return clean
+        return f"{model_id}_{int(index)}"
 
     def build(self) -> RandomizedWarehouseBuildResult:
         if self._spawn_robots_only:
@@ -1739,8 +1813,18 @@ class RandomizedWarehouseBuilder:
     def _sample_rollouts(self) -> None:
         occupancy_map = OccupancyMap.load(str(self._nav2_map_path))
         focus_xy = None if self._focus_object is None else self._focus_object.center_xyz[:2]
+        self._rollout_robot_teams = self._sample_rollout_robot_teams()
+        team_model_ids = sorted(
+            {
+                member["model"]
+                for team in self._rollout_robot_teams
+                for member in team
+                if str(member.get("model", "")).strip()
+            }
+        )
+        team_adapters = [build_robot_adapter(model_id) for model_id in team_model_ids]
         max_planar_radius_m = max(
-            float(adapter.default_planar_radius_m) for adapter in self._robot_adapters
+            float(adapter.default_planar_radius_m) for adapter in team_adapters
         )
         robot_padding_inflation_radius_m = max_planar_radius_m + 0.10
         ros_costmap_inflation_radius_m = self._ros_costmap_inflation_radius_m()
@@ -1750,15 +1834,17 @@ class RandomizedWarehouseBuilder:
         )
         self._rollouts_payload, self._sampling_validation = sample_multi_robot_rollouts(
             occupancy_map=occupancy_map,
-            robot_names=self._robot_names,
             rollout_count=self._rollout_count,
             rng=self._rng,
             inflation_radius_m=sampling_inflation_radius_m,
             min_pairwise_distance_m=max(1.5, max_planar_radius_m * 2.5),
             min_goal_distance_m=3.0,
+            robot_teams=self._rollout_robot_teams,
             focus_xy=focus_xy,
             focus_distance_range_m=self._template.focus_distance_range_m,
         )
+        if self._rollout_robot_teams:
+            self._activate_robot_team(self._rollout_robot_teams[0])
         self._sampling_validation.update(
             {
                 "inflation_source": "max_robot_padding_and_ros_costmaps",
@@ -1768,6 +1854,8 @@ class RandomizedWarehouseBuilder:
                     str(self._repo_root / relative_path)
                     for relative_path in ROS_COSTMAP_PARAMS_RELS
                 ],
+                "robot_team_mode": self._active_robot_team_mode(),
+                "robot_team_policy": self._robot_team_policy_payload(),
             }
         )
 
@@ -1793,19 +1881,26 @@ class RandomizedWarehouseBuilder:
             robot_model = str(payload.get("robot_model", "nova_carter") or "nova_carter").strip()
             robot_models = [robot_model]
         if len(robot_models) == 1:
-            robot_models = robot_models * len(first_robots)
-        if len(robot_models) < len(first_robots):
-            robot_models.extend([robot_models[-1]] * (len(first_robots) - len(robot_models)))
+            max_robots = max(len(list(rollout.get("robots", []) or [])) for rollout in rollouts)
+            robot_models = robot_models * max_robots
 
-        self._robot_count = len(first_robots)
-        self._robot_names = [
-            str(robot.get("name", f"robot{index}"))
-            for index, robot in enumerate(first_robots, start=1)
-        ]
-        self._robot_adapters = [
-            build_robot_adapter(model_id)
-            for model_id in robot_models[: self._robot_count]
-        ]
+        self._rollout_robot_teams = []
+        for rollout in rollouts:
+            robots = list(rollout.get("robots", []) or [])
+            if not robots:
+                raise RuntimeError(
+                    f"Existing team config rollout {rollout.get('id', '<unknown>')} has no robots: "
+                    f"{self._team_config_path}"
+                )
+            self._rollout_robot_teams.append(
+                self._rollout_team_from_robots(
+                    robots,
+                    fallback_models=robot_models,
+                    fallback_model=str(payload.get("robot_model", "nova_carter") or "nova_carter"),
+                )
+            )
+
+        self._activate_robot_team(self._rollout_robot_teams[0])
         self._rollout_count = len(rollouts)
         self._rollouts_payload = rollouts
         validation = payload.get("validation", {}) or {}
@@ -1827,10 +1922,14 @@ class RandomizedWarehouseBuilder:
         self._robot_prim_paths = []
 
         first_rollout = self._rollouts_payload[0]
-        for index, (robot_name, adapter) in enumerate(zip(self._robot_names, self._robot_adapters), start=1):
-            robot_prim_path = f"{self._robots_root}/{adapter.model_id}_{index}"
-            robot_config = next(
-                robot for robot in first_rollout["robots"] if robot["name"] == robot_name
+        first_robots = list(first_rollout.get("robots", []) or [])
+        first_team = self._rollout_team_from_robots(first_robots)
+        self._activate_robot_team(first_team)
+        for index, robot_config in enumerate(first_robots, start=1):
+            adapter = build_robot_adapter(robot_config["model"])
+            robot_prim_path = (
+                f"{self._robots_root}/"
+                f"{self._prim_name_for_robot(robot_name=robot_config['name'], model_id=adapter.model_id, index=index)}"
             )
             initial_pose = robot_config["initial_pose"]
             adapter.spawn_robot(
@@ -1987,6 +2086,12 @@ class RandomizedWarehouseBuilder:
             "rollout_sampling": dict(self._sampling_validation),
             "map_export_debug": self._map_export_debug_payload(),
             "robot_count": int(self._robot_count),
+            "rollout_robot_counts": [
+                len(list(rollout.get("robots", []) or []))
+                for rollout in self._rollouts_payload
+            ],
+            "robot_team_mode": self._active_robot_team_mode(),
+            "robot_team_policy": self._robot_team_policy_payload(),
             "rollout_count": int(self._rollout_count),
             "ros_runtime_enabled": bool(self._enable_ros2_runtime),
         }
@@ -2007,7 +2112,9 @@ class RandomizedWarehouseBuilder:
             "seed": int(self._seed),
             "usd_path": str(self._scene_usd_path),
             "robot_model": first_robot_model,
-            "robot_team_mode": DEFAULT_ROBOT_TEAM_MODE,
+            "robot_models": self._robot_model_ids_for_manifest(),
+            "robot_team_mode": self._active_robot_team_mode(),
+            "robot_team_policy": self._robot_team_policy_payload(),
             "language_instruction": self._language_instruction,
             "environment": {
                 "nav2_map": self._bundle_relative_path(self._nav2_map_path),
@@ -2052,8 +2159,11 @@ class RandomizedWarehouseBuilder:
             "scene_usd_path": str(self._scene_usd_path),
             "collection_metadata_path": self._collection_metadata_path_string(),
             "language_instruction": self._language_instruction,
-            "robot_models": [adapter.model_id for adapter in self._robot_adapters],
+            "robot_models": self._robot_model_ids_for_manifest(),
             "robot_namespaces": list(self._robot_names),
+            "rollout_robot_teams": list(getattr(self, "_rollout_robot_teams", [])),
+            "robot_team_mode": self._active_robot_team_mode(),
+            "robot_team_policy": self._robot_team_policy_payload(),
             "focus_object": None if self._focus_object is None else self._focus_object.as_dict(),
             "focus_selection": self._focus_selection_debug_payload(),
             "resolved_object_groups": dict(self._resolved_group_details),

@@ -8,6 +8,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
+from isaac_sim.stage_bringups.warehouse_randomized.robot_teams import (
+    RobotTeamPolicy,
+    parse_robot_team_policy,
+)
+
 
 DEFAULT_TEMPLATE_CONFIG_DIRNAME = "template_configs"
 DEFAULT_SHARED_TEMPLATE_CONFIG_BASENAME = "warehouse_shared.yaml"
@@ -216,6 +221,7 @@ class WarehouseTemplate:
     object_randomizers: tuple[ObjectRandomizationSpec, ...]
     focus_group_names: tuple[str, ...]
     focus_distance_range_m: tuple[float, float]
+    robot_team: RobotTeamPolicy
     metadata: dict[str, Any]
     scene_generation_max_attempts: int = DEFAULT_SCENE_GENERATION_MAX_ATTEMPTS
 
@@ -546,6 +552,7 @@ def _warehouse_template_from_payload(
             payload.get("focus_distance_range_m", (2.5, 5.25)),
             field_name="focus_distance_range_m",
         ),
+        robot_team=parse_robot_team_policy(payload.get("robot_team")),
         scene_generation_max_attempts=_parse_scene_generation_max_attempts(
             payload.get("scene_generation"),
             field_name="scene_generation",

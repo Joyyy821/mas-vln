@@ -64,6 +64,12 @@ class RolloutManager(Node):
         self._post_rollout_delay_sec = float(self.get_parameter("post_rollout_delay_sec").value)
 
         self._team_config = team_config_utils.load_multi_rollout_config(self._team_config_path)
+        if self._team_config.get("variable_agent_count") or self._team_config.get("variable_robot_namespaces"):
+            raise ValueError(
+                "isaac_ros_mapf_rollouts.launch.py does not yet support variable heterogeneous "
+                "robot teams in one persistent MAPF process. Use isaac_ros_mapf.launch.py with "
+                "rollout_id:=<id> for a single rollout."
+            )
         self._rollouts: list[dict[str, Any]] = list(self._team_config["rollouts"])
         if not self._rollouts:
             raise ValueError(f"No rollouts were configured in {self._team_config_path}.")

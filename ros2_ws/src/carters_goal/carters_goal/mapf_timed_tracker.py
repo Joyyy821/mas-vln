@@ -107,6 +107,13 @@ class TrackingErrorStats:
             self.angular_saturation_count += 1
 
 
+@dataclass
+class RotationState:
+    phase_label: str
+    target_yaw: float
+    preferred_sign: float
+
+
 class MapfTimedTracker(Node):
     def __init__(self) -> None:
         super().__init__("plan_executor")
@@ -114,7 +121,7 @@ class MapfTimedTracker(Node):
         self.declare_parameter("agent_num", 1)
         self.declare_parameter("global_frame_id", "map")
         self.declare_parameter("global_plan_topic", "global_plan")
-        self.declare_parameter("control_frequency", 10.0)
+        self.declare_parameter("control_frequency", 20.0)
         self.declare_parameter("mapf_step_duration", 0.5)
         self.declare_parameter("goal_position_tolerance", 0.08)
         self.declare_parameter("goal_yaw_tolerance", 0.08)
@@ -129,6 +136,10 @@ class MapfTimedTracker(Node):
         self.declare_parameter("integral_limit", 0.2)
         self.declare_parameter("max_linear_speed", 0.5)
         self.declare_parameter("max_angular_speed", 1.0)
+        self.declare_parameter("rotation_max_angular_speed", 0.25)
+        self.declare_parameter("rotation_yaw_kp", 0.8)
+        self.declare_parameter("rotation_debug_period_sec", 2.0)
+        self.declare_parameter("rotation_pi_hysteresis_rad", 0.35)
         self.declare_parameter("save_tracking_log", True)
         self.declare_parameter("tracking_log_dir", "/tmp/mapf_timed_tracker")
         self.declare_parameter("execution_status_topic", "/mapf_base/plan_execution_status")
@@ -162,6 +173,20 @@ class MapfTimedTracker(Node):
         self._integral_limit = float(self.get_parameter("integral_limit").value)
         self._max_linear_speed = float(self.get_parameter("max_linear_speed").value)
         self._max_angular_speed = float(self.get_parameter("max_angular_speed").value)
+        self._rotation_max_angular_speed = min(
+            abs(float(self.get_parameter("rotation_max_angular_speed").value)),
+            abs(self._max_angular_speed),
+        )
+        if self._rotation_max_angular_speed <= 1e-6:
+            self._rotation_max_angular_speed = abs(self._max_angular_speed)
+        self._rotation_yaw_kp = float(self.get_parameter("rotation_yaw_kp").value)
+        self._rotation_debug_period_ns = int(
+            max(float(self.get_parameter("rotation_debug_period_sec").value), 0.0) * 1e9
+        )
+        self._rotation_pi_hysteresis_rad = max(
+            float(self.get_parameter("rotation_pi_hysteresis_rad").value),
+            0.0,
+        )
         self._save_tracking_log = bool(self.get_parameter("save_tracking_log").value)
         self._tracking_log_dir = str(self.get_parameter("tracking_log_dir").value)
         self._default_tracking_log_dir = self._tracking_log_dir
@@ -175,14 +200,38 @@ class MapfTimedTracker(Node):
         self._agent_names: List[str] = []
         self._base_frame_ids: List[str] = []
         self._cmd_vel_topics: List[str] = []
+        self._agent_max_linear_speeds: List[float] = []
+        self._agent_max_angular_speeds: List[float] = []
+        self._agent_rotation_max_angular_speeds: List[float] = []
+        self._agent_rotation_yaw_kps: List[float] = []
+        self._agent_tracking_longitudinal_kps: List[float] = []
+        self._agent_tracking_lateral_kps: List[float] = []
+        self._agent_tracking_yaw_kps: List[float] = []
+        self._agent_integral_limits: List[float] = []
         self._cmd_vel_publishers = []
         for idx in range(self._agent_num):
             agent_param = f"agent_name.agent_{idx}"
             base_frame_param = f"base_frame_id.agent_{idx}"
             cmd_vel_param = f"cmd_vel_topic.agent_{idx}"
+            max_linear_param = f"agent_max_linear_speed.agent_{idx}"
+            max_angular_param = f"agent_max_angular_speed.agent_{idx}"
+            rotation_max_angular_param = f"agent_rotation_max_angular_speed.agent_{idx}"
+            rotation_yaw_kp_param = f"agent_rotation_yaw_kp.agent_{idx}"
+            tracking_longitudinal_kp_param = f"agent_tracking_longitudinal_kp.agent_{idx}"
+            tracking_lateral_kp_param = f"agent_tracking_lateral_kp.agent_{idx}"
+            tracking_yaw_kp_param = f"agent_tracking_yaw_kp.agent_{idx}"
+            integral_limit_param = f"agent_integral_limit.agent_{idx}"
             self.declare_parameter(agent_param, f"robot{idx + 1}")
             self.declare_parameter(base_frame_param, f"robot{idx + 1}/base_link")
             self.declare_parameter(cmd_vel_param, f"/robot{idx + 1}/cmd_vel")
+            self.declare_parameter(max_linear_param, self._max_linear_speed)
+            self.declare_parameter(max_angular_param, self._max_angular_speed)
+            self.declare_parameter(rotation_max_angular_param, self._rotation_max_angular_speed)
+            self.declare_parameter(rotation_yaw_kp_param, self._rotation_yaw_kp)
+            self.declare_parameter(tracking_longitudinal_kp_param, self._tracking_longitudinal_kp)
+            self.declare_parameter(tracking_lateral_kp_param, self._tracking_lateral_kp)
+            self.declare_parameter(tracking_yaw_kp_param, self._tracking_yaw_kp)
+            self.declare_parameter(integral_limit_param, self._integral_limit)
 
             agent_name = str(self.get_parameter(agent_param).value)
             base_frame_id = str(self.get_parameter(base_frame_param).value)
@@ -190,6 +239,30 @@ class MapfTimedTracker(Node):
             self._agent_names.append(agent_name)
             self._base_frame_ids.append(base_frame_id)
             self._cmd_vel_topics.append(cmd_vel_topic)
+            self._agent_max_linear_speeds.append(
+                max(float(self.get_parameter(max_linear_param).value), 0.0)
+            )
+            self._agent_max_angular_speeds.append(
+                max(float(self.get_parameter(max_angular_param).value), 0.0)
+            )
+            agent_rotation_max_angular = min(
+                max(float(self.get_parameter(rotation_max_angular_param).value), 0.0),
+                self._agent_max_angular_speeds[-1],
+            )
+            if agent_rotation_max_angular <= 1e-6:
+                agent_rotation_max_angular = self._agent_max_angular_speeds[-1]
+            self._agent_rotation_max_angular_speeds.append(agent_rotation_max_angular)
+            self._agent_rotation_yaw_kps.append(float(self.get_parameter(rotation_yaw_kp_param).value))
+            self._agent_tracking_longitudinal_kps.append(
+                float(self.get_parameter(tracking_longitudinal_kp_param).value)
+            )
+            self._agent_tracking_lateral_kps.append(
+                float(self.get_parameter(tracking_lateral_kp_param).value)
+            )
+            self._agent_tracking_yaw_kps.append(float(self.get_parameter(tracking_yaw_kp_param).value))
+            self._agent_integral_limits.append(
+                max(float(self.get_parameter(integral_limit_param).value), 0.0)
+            )
             self._cmd_vel_publishers.append(self.create_publisher(Twist, cmd_vel_topic, 1))
 
         self._tf_buffer = Buffer()
@@ -206,6 +279,8 @@ class MapfTimedTracker(Node):
         self._trajectory_start_time: Time | None = None
         self._max_translation_duration = 0.0
         self._last_tf_warn_ns = [0 for _ in range(self._agent_num)]
+        self._last_rotation_debug_ns = [0 for _ in range(self._agent_num)]
+        self._rotation_states: List[RotationState | None] = [None for _ in range(self._agent_num)]
         self._tracking_error_stats = [TrackingErrorStats() for _ in range(self._agent_num)]
         self._tracking_summary_logged = [False for _ in range(self._agent_num)]
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
@@ -239,6 +314,17 @@ class MapfTimedTracker(Node):
             f"'{self.resolve_topic_name(self._global_plan_topic)}' "
             f"for {self._agent_num} agents. cmd_vel topics: {self._cmd_vel_topics}"
         )
+        for agent_idx, agent_name in enumerate(self._agent_names):
+            self.get_logger().info(
+                f"Agent {agent_idx} ({agent_name}) timed-tracker params: "
+                f"max_linear={self._agent_max_linear_speeds[agent_idx]:.3f}, "
+                f"max_angular={self._agent_max_angular_speeds[agent_idx]:.3f}, "
+                f"rotation_max_angular={self._agent_rotation_max_angular_speeds[agent_idx]:.3f}, "
+                f"rotation_yaw_kp={self._agent_rotation_yaw_kps[agent_idx]:.3f}, "
+                f"tracking_kp=({self._agent_tracking_longitudinal_kps[agent_idx]:.3f}, "
+                f"{self._agent_tracking_lateral_kps[agent_idx]:.3f}, "
+                f"{self._agent_tracking_yaw_kps[agent_idx]:.3f})."
+            )
 
     def _plan_callback(self, plan_msg: GlobalPlan) -> None:
         if len(plan_msg.global_plan) < self._agent_num:
@@ -280,6 +366,7 @@ class MapfTimedTracker(Node):
         self._tracking_error_stats = [TrackingErrorStats() for _ in range(self._agent_num)]
         self._tracking_summary_logged = [False for _ in range(self._agent_num)]
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
+        self._rotation_states = [None for _ in range(self._agent_num)]
         self._reset_all_integrators()
         self._publish_execution_status("active")
 
@@ -297,6 +384,12 @@ class MapfTimedTracker(Node):
             durations.append(trajectory.translation_duration)
             self._pre_rotate_complete[agent_idx] = trajectory.pre_rotate_yaw is None
             self._phases[agent_idx] = "track" if trajectory.pre_rotate_yaw is None else "pre_rotate"
+            if trajectory.pre_rotate_yaw is not None:
+                self.get_logger().info(
+                    f"Agent {agent_idx} starting pre-rotation toward yaw "
+                    f"{trajectory.pre_rotate_yaw:.3f} rad using max angular speed "
+                    f"{self._agent_rotation_max_angular_speeds[agent_idx]:.3f} rad/s."
+                )
 
         self._max_translation_duration = max(durations, default=0.0)
         duration_text = ", ".join(f"{duration:.2f}s" for duration in durations)
@@ -334,6 +427,7 @@ class MapfTimedTracker(Node):
                     agent_idx,
                     trajectory.pre_rotate_yaw,
                     self._pre_rotate_yaw_tolerance,
+                    phase_label="pre_rotate",
                 ):
                     self._pre_rotate_complete[agent_idx] = True
                     self._publish_zero(agent_idx)
@@ -376,6 +470,7 @@ class MapfTimedTracker(Node):
                     agent_idx,
                     trajectory.final_goal_yaw,
                     self._goal_yaw_tolerance,
+                    phase_label="post_rotate",
                 ):
                     self._publish_zero(agent_idx)
                     self._completed[agent_idx] = True
@@ -419,6 +514,7 @@ class MapfTimedTracker(Node):
         self._tracking_error_stats = [TrackingErrorStats() for _ in range(self._agent_num)]
         self._tracking_summary_logged = [False for _ in range(self._agent_num)]
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
+        self._rotation_states = [None for _ in range(self._agent_num)]
         self._reset_all_integrators()
         self._publish_zero_to_all()
 
@@ -435,6 +531,7 @@ class MapfTimedTracker(Node):
                 continue
             if self._phases[agent_idx] == "pre_rotate":
                 self._phases[agent_idx] = "track"
+            self._rotation_states[agent_idx] = None
         self.get_logger().info(
             "All agents finished pre-rotation. Starting the shared timed trajectory clock "
             f"at t=0.0s with a global translation horizon of {self._max_translation_duration:.2f}s."
@@ -537,23 +634,23 @@ class MapfTimedTracker(Node):
 
         self._integral_x[agent_idx] = self._clamp(
             self._integral_x[agent_idx] + error_x_body * dt,
-            -self._integral_limit,
-            self._integral_limit,
+            -self._agent_integral_limits[agent_idx],
+            self._agent_integral_limits[agent_idx],
         )
         self._integral_y[agent_idx] = self._clamp(
             self._integral_y[agent_idx] + error_y_body * dt,
-            -self._integral_limit,
-            self._integral_limit,
+            -self._agent_integral_limits[agent_idx],
+            self._agent_integral_limits[agent_idx],
         )
         self._integral_yaw[agent_idx] = self._clamp(
             self._integral_yaw[agent_idx] + yaw_error * dt,
-            -self._integral_limit,
-            self._integral_limit,
+            -self._agent_integral_limits[agent_idx],
+            self._agent_integral_limits[agent_idx],
         )
 
         linear_cmd = (
             ref.linear_velocity
-            + self._tracking_longitudinal_kp * error_x_body
+            + self._agent_tracking_longitudinal_kps[agent_idx] * error_x_body
             + self._tracking_longitudinal_ki * self._integral_x[agent_idx]
         )
         linear_cmd *= max(0.0, math.cos(yaw_error))
@@ -563,17 +660,21 @@ class MapfTimedTracker(Node):
 
         angular_cmd = (
             ref.angular_velocity
-            + self._tracking_lateral_kp * error_y_body
+            + self._agent_tracking_lateral_kps[agent_idx] * error_y_body
             + self._tracking_lateral_ki * self._integral_y[agent_idx]
-            + self._tracking_yaw_kp * yaw_error
+            + self._agent_tracking_yaw_kps[agent_idx] * yaw_error
             + self._tracking_yaw_ki * self._integral_yaw[agent_idx]
         )
 
-        clamped_linear_cmd = self._clamp(linear_cmd, 0.0, self._max_linear_speed)
+        clamped_linear_cmd = self._clamp(
+            linear_cmd,
+            0.0,
+            self._agent_max_linear_speeds[agent_idx],
+        )
         clamped_angular_cmd = self._clamp(
             angular_cmd,
-            -self._max_angular_speed,
-            self._max_angular_speed,
+            -self._agent_max_angular_speeds[agent_idx],
+            self._agent_max_angular_speeds[agent_idx],
         )
         linear_saturated = abs(clamped_linear_cmd - linear_cmd) > 1e-6
         angular_saturated = abs(clamped_angular_cmd - angular_cmd) > 1e-6
@@ -743,6 +844,8 @@ class MapfTimedTracker(Node):
         agent_idx: int,
         target_yaw: float | None,
         tolerance: float,
+        *,
+        phase_label: str,
     ) -> bool:
         if target_yaw is None:
             return True
@@ -752,18 +855,94 @@ class MapfTimedTracker(Node):
             self._publish_zero(agent_idx)
             return False
 
-        yaw_error = self._normalize_angle(target_yaw - pose[2])
+        yaw_error = self._bounded_rotation_error(
+            agent_idx=agent_idx,
+            phase_label=phase_label,
+            current_yaw=pose[2],
+            target_yaw=target_yaw,
+        )
         if abs(yaw_error) <= tolerance:
+            self._rotation_states[agent_idx] = None
             return True
 
-        twist = Twist()
-        twist.angular.z = self._clamp(
-            self._tracking_yaw_kp * yaw_error,
-            -self._max_angular_speed,
-            self._max_angular_speed,
+        angular_cmd = self._clamp(
+            self._agent_rotation_yaw_kps[agent_idx] * yaw_error,
+            -self._agent_rotation_max_angular_speeds[agent_idx],
+            self._agent_rotation_max_angular_speeds[agent_idx],
         )
+        self._maybe_log_rotation_debug(
+            agent_idx=agent_idx,
+            phase_label=phase_label,
+            current_yaw=pose[2],
+            target_yaw=target_yaw,
+            yaw_error=yaw_error,
+            angular_cmd=angular_cmd,
+        )
+
+        twist = Twist()
+        twist.angular.z = angular_cmd
         self._cmd_vel_publishers[agent_idx].publish(twist)
         return False
+
+    def _bounded_rotation_error(
+        self,
+        *,
+        agent_idx: int,
+        phase_label: str,
+        current_yaw: float,
+        target_yaw: float,
+    ) -> float:
+        target_yaw = self._normalize_angle(target_yaw)
+        yaw_error = self._normalize_angle(target_yaw - current_yaw)
+        state = self._rotation_states[agent_idx]
+        if (
+            state is None
+            or state.phase_label != phase_label
+            or abs(self._normalize_angle(target_yaw - state.target_yaw)) > 1e-6
+        ):
+            preferred_sign = 1.0 if yaw_error >= 0.0 else -1.0
+            state = RotationState(
+                phase_label=phase_label,
+                target_yaw=target_yaw,
+                preferred_sign=preferred_sign,
+            )
+            self._rotation_states[agent_idx] = state
+
+        # The direct shortest-angle error is discontinuous at +/-pi. Keep the
+        # initially selected side only inside that narrow antipodal band; the
+        # returned magnitude is still the current bounded error, never an
+        # accumulated yaw delta.
+        if (
+            self._rotation_pi_hysteresis_rad > 0.0
+            and math.pi - abs(yaw_error) <= self._rotation_pi_hysteresis_rad
+        ):
+            return math.copysign(abs(yaw_error), state.preferred_sign)
+
+        return yaw_error
+
+    def _maybe_log_rotation_debug(
+        self,
+        *,
+        agent_idx: int,
+        phase_label: str,
+        current_yaw: float,
+        target_yaw: float,
+        yaw_error: float,
+        angular_cmd: float,
+    ) -> None:
+        if self._rotation_debug_period_ns <= 0:
+            return
+
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._last_rotation_debug_ns[agent_idx] < self._rotation_debug_period_ns:
+            return
+
+        self._last_rotation_debug_ns[agent_idx] = now_ns
+        self.get_logger().info(
+            f"Agent {agent_idx} {phase_label}: current_yaw={current_yaw:.3f}, "
+            f"target_yaw={target_yaw:.3f}, yaw_error={yaw_error:.3f}, "
+            f"cmd_angular_z={angular_cmd:.3f}."
+        )
 
     def _reset_integrator(self, agent_idx: int) -> None:
         self._integral_x[agent_idx] = 0.0

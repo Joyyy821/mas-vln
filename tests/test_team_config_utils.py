@@ -116,6 +116,69 @@ class TeamConfigUtilsTests(unittest.TestCase):
                 str(maps_dir / "carter_warehouse_navigation.yaml"),
             )
 
+    def test_select_rollout_supports_variable_heterogeneous_teams(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle_dir = Path(tmpdir)
+            team_config_path = bundle_dir / "team_config.yaml"
+            payload = {
+                "environment": {},
+                "rollouts": [
+                    {
+                        "id": 1,
+                        "robots": [
+                            {
+                                "name": "nova_carter",
+                                "model": "nova_carter",
+                                "initial_pose": {"x": 0, "y": 0, "z": 0, "yaw": 0},
+                                "goal_pose": {"x": 1, "y": 0, "z": 0, "yaw": 0},
+                            },
+                            {
+                                "name": "carter_v1",
+                                "model": "carter_v1",
+                                "initial_pose": {"x": 0, "y": 1, "z": 0, "yaw": 0},
+                                "goal_pose": {"x": 1, "y": 1, "z": 0, "yaw": 0},
+                            },
+                        ],
+                    },
+                    {
+                        "id": 2,
+                        "robots": [
+                            {
+                                "name": "nova_carter",
+                                "model": "nova_carter",
+                                "initial_pose": {"x": 0, "y": 0, "z": 0, "yaw": 0},
+                                "goal_pose": {"x": 1, "y": 0, "z": 0, "yaw": 0},
+                            },
+                            {
+                                "name": "carter_v1",
+                                "model": "carter_v1",
+                                "initial_pose": {"x": 0, "y": 1, "z": 0, "yaw": 0},
+                                "goal_pose": {"x": 1, "y": 1, "z": 0, "yaw": 0},
+                            },
+                            {
+                                "name": "jackal",
+                                "model": "jackal",
+                                "initial_pose": {"x": 0, "y": 2, "z": 0, "yaw": 0},
+                                "goal_pose": {"x": 1, "y": 2, "z": 0, "yaw": 0},
+                            },
+                        ],
+                    },
+                ],
+            }
+            team_config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+            multi = team_config_utils.load_multi_rollout_config(str(team_config_path))
+            selected = team_config_utils.load_team_config(
+                str(team_config_path),
+                rollout_id=2,
+            )
+
+            self.assertTrue(multi["variable_agent_count"])
+            self.assertEqual(multi["rollout_agent_counts"], [2, 3])
+            self.assertEqual(selected["agent_num"], 3)
+            self.assertEqual(selected["robot_namespaces"], ["nova_carter", "carter_v1", "jackal"])
+            self.assertEqual(selected["robot_models"], ["nova_carter", "carter_v1", "jackal"])
+
 
 if __name__ == "__main__":
     unittest.main()

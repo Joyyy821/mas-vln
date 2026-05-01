@@ -194,7 +194,17 @@ def _selected_rollouts(team_config: dict[str, Any], *, rollout_id: int, all_roll
     raise ValueError(f"Rollout id {rollout_id} was not found. Available ids: {available_ids}")
 
 
-def _robot_model_ids(team_config: dict[str, Any], robot_count: int) -> list[str]:
+def _robot_model_ids(
+    team_config: dict[str, Any],
+    robot_count: int,
+    rollout: dict[str, Any] | None = None,
+) -> list[str]:
+    if rollout is not None:
+        robots = list(rollout.get("robots", []) or [])
+        models = [str(robot.get("model", "") or "").strip() for robot in robots]
+        if all(models):
+            return models[:robot_count]
+
     robot_models = [str(model).strip() for model in team_config.get("robot_models", []) if str(model).strip()]
     if not robot_models:
         robot_model = str(team_config.get("robot_model", "nova_carter") or "nova_carter").strip()
@@ -345,27 +355,34 @@ def _ensure_robot_prims(
     spawn_missing_robots: bool,
 ) -> list[str]:
     existing_paths = _robot_prim_paths(robot_root_path)
-    if len(existing_paths) >= robot_count:
-        return existing_paths[:robot_count]
     if not spawn_missing_robots:
+        if len(existing_paths) >= robot_count:
+            return existing_paths[:robot_count]
         raise RuntimeError(
             f"Found {len(existing_paths)} robot prims under {robot_root_path}, expected {robot_count}."
         )
 
     from isaacsim.storage.native import get_assets_root_path
-    from isaac_sim.stage_bringups.runtime_utils import ensure_xform_path
+    from isaac_sim.stage_bringups.runtime_utils import ensure_xform_path, get_stage
     from isaac_sim.stage_bringups.warehouse_randomized.robots import build_robot_adapter
 
     assets_root_path = str(get_assets_root_path()).rstrip("/")
+    stage = get_stage()
     ensure_xform_path(robot_root_path)
+    root = stage.GetPrimAtPath(robot_root_path)
+    if root and root.IsValid():
+        for child in list(root.GetChildren()):
+            stage.RemovePrim(child.GetPath())
+
     robots = list(first_rollout.get("robots", []) or [])
-    spawned_paths = list(existing_paths)
-    for robot_index in range(len(existing_paths), robot_count):
+    spawned_paths: list[str] = []
+    for robot_index in range(robot_count):
         robot = robots[robot_index]
         position_xyz, yaw_rad = _pose_xyz_yaw(robot.get("goal_pose", {}) or {})
         model_id = robot_models[robot_index]
         adapter = build_robot_adapter(model_id)
-        prim_path = f"{robot_root_path}/{adapter.model_id}_{robot_index + 1}"
+        prim_name = str(robot.get("name", "") or adapter.model_id).strip().replace("-", "_")
+        prim_path = f"{robot_root_path}/{prim_name}"
         adapter.spawn_robot(
             assets_root_path=assets_root_path,
             prim_path=prim_path,
@@ -503,16 +520,6 @@ def main() -> int:
         sim_app = maybe_start_sim_app(headless=bool(args.headless))
         try:
             _open_stage(scene_usd_path, sim_app, warmup_updates=int(args.warmup_updates))
-            first_rollout = rollouts[0]
-            robot_count = len(first_rollout.get("robots", []) or [])
-            robot_models = _robot_model_ids(team_config, robot_count)
-            robot_prim_paths = _ensure_robot_prims(
-                robot_count=robot_count,
-                robot_models=robot_models,
-                first_rollout=first_rollout,
-                robot_root_path=str(args.robot_root),
-                spawn_missing_robots=not bool(args.no_spawn_missing_robots),
-            )
 
             if args.all_rollouts and not args.headless:
                 _pre_cycle_gui_pause(
@@ -522,6 +529,15 @@ def main() -> int:
                 )
 
             for rollout in rollouts:
+                robot_count = len(rollout.get("robots", []) or [])
+                robot_models = _robot_model_ids(team_config, robot_count, rollout=rollout)
+                robot_prim_paths = _ensure_robot_prims(
+                    robot_count=robot_count,
+                    robot_models=robot_models,
+                    first_rollout=rollout,
+                    robot_root_path=str(args.robot_root),
+                    spawn_missing_robots=not bool(args.no_spawn_missing_robots),
+                )
                 _place_rollout_goal_poses(
                     rollout=rollout,
                     robot_prim_paths=robot_prim_paths,

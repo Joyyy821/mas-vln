@@ -12,6 +12,15 @@ metadata:
 scene_generation:
   max_attempts: 10
 
+robot_team:
+  mode: heterogeneous_priority_v1
+  count_distribution:
+    2: 0.2
+    3: 0.5
+    4: 0.3
+  model_priority: [nova_carter, carter_v1, jackal, limo]
+  namespace_scheme: model_name
+
 nav2_map:
   resolution_m: 0.05
   origin_hint_xyz: [-11.975, -17.975, 0.0]

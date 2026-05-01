@@ -48,6 +48,75 @@ def _load_team_config_utils():
 team_config_utils = _load_team_config_utils()
 
 
+_TIMED_TRACKER_DEFAULT_PROFILE = {
+    "agent_max_linear_speed": 0.18,
+    "agent_max_angular_speed": 0.35,
+    "agent_rotation_max_angular_speed": 0.20,
+    "agent_rotation_yaw_kp": 0.55,
+    "agent_tracking_longitudinal_kp": 0.40,
+    "agent_tracking_lateral_kp": 0.30,
+    "agent_tracking_yaw_kp": 0.40,
+    "agent_integral_limit": 0.0,
+}
+
+_TIMED_TRACKER_MODEL_PROFILES = {
+    "nova_carter": {
+        "agent_max_linear_speed": 0.35,
+        "agent_max_angular_speed": 0.50,
+        "agent_rotation_max_angular_speed": 0.35,
+        "agent_rotation_yaw_kp": 0.70,
+        "agent_tracking_longitudinal_kp": 1.6,
+        "agent_tracking_lateral_kp": 2.25,
+        "agent_tracking_yaw_kp": 1.5,
+        "agent_integral_limit": 0.0,
+    },
+    "carter_v1": {
+        "agent_max_linear_speed": 0.10,
+        "agent_max_angular_speed": 0.25,
+        "agent_rotation_max_angular_speed": 0.16,
+        "agent_rotation_yaw_kp": 0.45,
+        "agent_tracking_longitudinal_kp": 0.35,
+        "agent_tracking_lateral_kp": 0.25,
+        "agent_tracking_yaw_kp": 0.35,
+        "agent_integral_limit": 0.0,
+    },
+    "jackal": {
+        "agent_max_linear_speed": 0.05,
+        "agent_max_angular_speed": 0.30,
+        "agent_rotation_max_angular_speed": 0.30,
+        "agent_rotation_yaw_kp": 0.50,
+        "agent_tracking_longitudinal_kp": 2.5,
+        "agent_tracking_lateral_kp": 2.0,
+        "agent_tracking_yaw_kp": 1.2,
+        "agent_integral_limit": 0.0,
+    },
+    "limo": {
+        "agent_max_linear_speed": 0.20,
+        "agent_max_angular_speed": 1.0,
+        "agent_rotation_max_angular_speed": 1.0,
+        "agent_rotation_yaw_kp": 2.25,
+        "agent_tracking_longitudinal_kp": 0.7,
+        "agent_tracking_lateral_kp": 2.5,
+        "agent_tracking_yaw_kp": 2.0,
+        "agent_integral_limit": 0.0,
+    },
+}
+
+
+def _timed_tracker_agent_param_maps(robot_namespaces, robot_models):
+    param_maps = {key: {} for key in _TIMED_TRACKER_DEFAULT_PROFILE}
+    for index, namespace in enumerate(robot_namespaces):
+        model_id = ""
+        if index < len(robot_models):
+            model_id = str(robot_models[index] or "").strip().lower()
+        if not model_id:
+            model_id = str(namespace or "").strip().lower()
+        profile = _TIMED_TRACKER_MODEL_PROFILES.get(model_id, _TIMED_TRACKER_DEFAULT_PROFILE)
+        for key, default_value in _TIMED_TRACKER_DEFAULT_PROFILE.items():
+            param_maps[key][f"agent_{index}"] = profile.get(key, default_value)
+    return param_maps
+
+
 def _launch_setup(context, *args, **kwargs):
     carters_nav2_dir = get_package_share_directory("carters_nav2")
 
@@ -57,8 +126,14 @@ def _launch_setup(context, *args, **kwargs):
     mapf_params_path = LaunchConfiguration("mapf_params_file").perform(context)
     costmap_params_path = LaunchConfiguration("mapf_costmap_params_file").perform(context)
     initial_pose_tf_params_path = LaunchConfiguration("initial_pose_tf_params_file").perform(context)
+    rollout_id_text = LaunchConfiguration("rollout_id").perform(context).strip()
+    rollout_id = int(rollout_id_text) if rollout_id_text else None
 
-    team_config = team_config_utils.load_team_config(team_config_path, maps_dir=maps_dir)
+    team_config = team_config_utils.load_team_config(
+        team_config_path,
+        maps_dir=maps_dir,
+        rollout_id=rollout_id,
+    )
     robot_namespaces = team_config["robot_namespaces"]
     agent_num = team_config["agent_num"]
     map_file = map_override or team_config["mapf_map"]
@@ -98,6 +173,12 @@ def _launch_setup(context, *args, **kwargs):
     )
     mapf_params["mapf_base"]["plan_executor"]["ros__parameters"]["progress_checker_id"] = (
         "progress_checker"
+    )
+    mapf_params["mapf_base"]["plan_executor"]["ros__parameters"].update(
+        _timed_tracker_agent_param_maps(
+            robot_namespaces,
+            team_config.get("robot_models", []),
+        )
     )
     generated_mapf_params = team_config_utils.write_temp_yaml("carters_goal_mapf_", mapf_params)
 
@@ -350,6 +431,14 @@ def generate_launch_description():
         ),
         description="Full path to the shared robot team configuration YAML.",
     )
+    rollout_id_arg = DeclareLaunchArgument(
+        "rollout_id",
+        default_value="",
+        description=(
+            "Optional rollout id to load from a multi-rollout team config. "
+            "Leave empty to use the first rollout."
+        ),
+    )
     mapf_params_arg = DeclareLaunchArgument(
         "mapf_params_file",
         default_value=os.path.join(carters_goal_dir, "config", "mapf_params_isaac.yaml"),
@@ -481,6 +570,7 @@ def generate_launch_description():
         [
             map_arg,
             team_config_arg,
+            rollout_id_arg,
             mapf_params_arg,
             costmap_params_arg,
             initial_pose_tf_params_arg,

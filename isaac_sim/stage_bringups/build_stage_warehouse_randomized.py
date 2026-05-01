@@ -30,12 +30,14 @@ from isaac_sim.stage_bringups.warehouse_randomized.templates import (  # noqa: E
     load_randomization_presets,
     load_shared_warehouse_defaults,
 )
+from isaac_sim.stage_bringups.warehouse_randomized.robot_teams import (  # noqa: E402
+    DEFAULT_ROBOT_TEAM_MODE,
+)
 
 
 DEFAULT_SCENE_ROOT_DIR = REPO_ROOT / "experiments" / "randomized_warehouse"
 DEFAULT_COLLECTION_LANGUAGE_INSTRUCTION = "go to the forklift near the shelf"
 DEFAULT_FOCUS_SELECTOR_ID = "forklift_near_shelf_min_world_x"
-DEFAULT_ROBOT_TEAM_MODE = "three_nova_carter_v1"
 DEFAULT_COLLECTION_METADATA_FILENAME = "collection_metadata.yaml"
 DEFAULT_RANDOMIZATION_STRENGTH = "balanced"
 DEFAULT_SCENES_PER_TEMPLATE = 5
@@ -473,15 +475,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--robot-count",
         type=int,
-        default=3,
-        help="How many robot poses to sample. Must be between 2 and 5.",
+        default=0,
+        help=(
+            "Optional fixed robot count override. Leave at 0 to sample each rollout's "
+            "heterogeneous team from the template robot_team policy."
+        ),
     )
     parser.add_argument(
         "--robot-models",
-        default="nova_carter",
+        default="",
         help=(
-            "Comma-separated robot model ids. Provide one model to reuse it for every robot, "
-            "or one entry per robot. v1 fully supports 'nova_carter'."
+            "Optional comma-separated fixed robot model override. Leave empty to use the "
+            "template robot_team policy. Supported ids: nova_carter, carter_v1, jackal, limo."
         ),
     )
     parser.add_argument(

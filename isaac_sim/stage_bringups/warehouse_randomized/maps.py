@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import yaml
@@ -448,12 +448,13 @@ def _pose_dict(x: float, y: float, yaw: float, z: float = 0.0) -> dict[str, floa
 def sample_multi_robot_rollouts(
     *,
     occupancy_map: OccupancyMap,
-    robot_names: Sequence[str],
     rollout_count: int,
     rng: np.random.Generator,
     inflation_radius_m: float,
     min_pairwise_distance_m: float,
     min_goal_distance_m: float,
+    robot_names: Sequence[str] | None = None,
+    robot_teams: Sequence[Sequence[Mapping[str, str]]] | None = None,
     focus_xy: Sequence[float] | None = None,
     focus_distance_range_m: tuple[float, float] = (2.5, 5.5),
     min_initial_focus_distance_m: float | None = None,
@@ -503,18 +504,47 @@ def sample_multi_robot_rollouts(
             )
 
     rollouts: list[dict[str, Any]] = []
-    robot_names = [str(name) for name in robot_names]
+    if robot_teams is None:
+        if robot_names is None:
+            raise ValueError("Either robot_names or robot_teams must be provided.")
+        fixed_team = [{"name": str(name), "model": ""} for name in robot_names]
+        robot_teams = [fixed_team for _ in range(int(rollout_count))]
+    else:
+        robot_teams = [
+            [
+                {
+                    "name": str(member.get("name", "")).strip(),
+                    "model": str(member.get("model", "")).strip(),
+                }
+                for member in team
+            ]
+            for team in robot_teams
+        ]
+        if len(robot_teams) != int(rollout_count):
+            raise ValueError(
+                f"robot_teams must contain exactly rollout_count teams, got {len(robot_teams)}."
+            )
+
     observed_initial_focus_distances: list[float] = []
     observed_initial_goal_distances: list[float] = []
     for rollout_index in range(int(rollout_count)):
+        rollout_team = list(robot_teams[rollout_index])
+        if not rollout_team:
+            raise ValueError(f"Rollout {rollout_index + 1} robot team is empty.")
+        robot_names_for_rollout = [member["name"] for member in rollout_team]
+        if any(not name for name in robot_names_for_rollout):
+            raise ValueError(f"Rollout {rollout_index + 1} contains an empty robot name.")
+        if len(set(robot_names_for_rollout)) != len(robot_names_for_rollout):
+            raise ValueError(f"Rollout {rollout_index + 1} contains duplicate robot names.")
+
         initial_indices = _greedy_sample_indices(
             occupancy_map,
             initial_candidate_mask,
-            count=len(robot_names),
+            count=len(rollout_team),
             rng=rng,
             min_separation_m=float(min_pairwise_distance_m),
         )
-        if len(initial_indices) != len(robot_names):
+        if len(initial_indices) != len(rollout_team):
             raise RuntimeError(
                 "Unable to sample enough collision-free initial poses outside the focus/goal area."
             )
@@ -525,30 +555,30 @@ def sample_multi_robot_rollouts(
         goal_indices = _greedy_sample_indices(
             occupancy_map,
             focus_candidate_mask,
-            count=len(robot_names),
+            count=len(rollout_team),
             rng=rng,
             min_separation_m=float(min_pairwise_distance_m),
             reference_points_xy=initial_xy,
             min_distance_from_references_m=float(min_goal_distance_m),
         )
-        if len(goal_indices) != len(robot_names):
+        if len(goal_indices) != len(rollout_team):
             goal_indices = _greedy_sample_indices(
                 occupancy_map,
                 navigation_mask,
-                count=len(robot_names),
+                count=len(rollout_team),
                 rng=rng,
                 min_separation_m=float(min_pairwise_distance_m),
                 reference_points_xy=initial_xy,
                 min_distance_from_references_m=float(min_goal_distance_m),
             )
-        if len(goal_indices) != len(robot_names):
+        if len(goal_indices) != len(rollout_team):
             raise RuntimeError(
                 "Unable to sample enough collision-free goal poses for the requested robot count."
             )
 
         robots: list[dict[str, Any]] = []
-        for robot_name, (init_row, init_col), (goal_row, goal_col) in zip(
-            robot_names, initial_indices, goal_indices
+        for member, (init_row, init_col), (goal_row, goal_col) in zip(
+            rollout_team, initial_indices, goal_indices
         ):
             init_xy = occupancy_map.cell_center_world_xy(init_row, init_col)
             goal_xy = occupancy_map.cell_center_world_xy(goal_row, goal_col)
@@ -565,16 +595,18 @@ def sample_multi_robot_rollouts(
             else:
                 goal_yaw = float(rng.uniform(-np.pi, np.pi))
 
-            robots.append(
-                {
-                    "name": robot_name,
-                    "initial_pose": _pose_dict(init_xy[0], init_xy[1], initial_yaw),
-                    "goal_pose": _pose_dict(goal_xy[0], goal_xy[1], goal_yaw),
-                }
-            )
+            robot_payload = {
+                "name": member["name"],
+                "initial_pose": _pose_dict(init_xy[0], init_xy[1], initial_yaw),
+                "goal_pose": _pose_dict(goal_xy[0], goal_xy[1], goal_yaw),
+            }
+            if member["model"]:
+                robot_payload["model"] = member["model"]
+            robots.append(robot_payload)
 
         rollouts.append({"id": rollout_index + 1, "robots": robots})
 
+    robot_counts = [len(team) for team in robot_teams]
     validation = {
         "inflation_radius_m": float(inflation_radius_m),
         "largest_component_free_cells": int(np.count_nonzero(navigation_mask)),
@@ -596,5 +628,8 @@ def sample_multi_robot_rollouts(
             if not observed_initial_goal_distances
             else float(min(observed_initial_goal_distances))
         ),
+        "rollout_robot_counts": robot_counts,
+        "min_rollout_robot_count": int(min(robot_counts)),
+        "max_rollout_robot_count": int(max(robot_counts)),
     }
     return rollouts, validation

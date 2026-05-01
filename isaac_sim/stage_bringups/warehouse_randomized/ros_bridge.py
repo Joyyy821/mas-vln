@@ -32,6 +32,34 @@ class _RobotStateCache:
     yaw_rad: float | None = None
 
 
+def _wheel_action_arrays(
+    controller: RuntimeRobotController,
+    *,
+    linear_x: float,
+    angular_z: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    right_velocity = (
+        (2.0 * float(linear_x)) + (float(angular_z) * controller.wheel_distance_m)
+    ) / (2.0 * controller.wheel_radius_m)
+    left_velocity = (
+        (2.0 * float(linear_x)) - (float(angular_z) * controller.wheel_distance_m)
+    ) / (2.0 * controller.wheel_radius_m)
+
+    joint_indices = np.concatenate(
+        [
+            np.asarray(controller.left_wheel_joint_indices, dtype=np.int32),
+            np.asarray(controller.right_wheel_joint_indices, dtype=np.int32),
+        ]
+    )
+    joint_velocities = np.concatenate(
+        [
+            np.full(len(controller.left_wheel_joint_indices), left_velocity, dtype=np.float32),
+            np.full(len(controller.right_wheel_joint_indices), right_velocity, dtype=np.float32),
+        ]
+    )
+    return joint_indices, joint_velocities
+
+
 class InternalIsaacRosBridge:
     """Minimal internal ROS bridge for sensorless differential-drive robots."""
 
@@ -56,7 +84,13 @@ class InternalIsaacRosBridge:
         except Exception as exc:
             raise RuntimeError(
                 "ROS 2 Python packages are unavailable inside the Isaac Sim runtime. "
-                "Launch this script from Isaac Sim 5.1 Python with the built-in ROS support enabled."
+                "Isaac Sim 5.1 uses Python 3.11, so do not source /opt/ros/humble "
+                "unless it was built for Python 3.11. Use Isaac Sim's bundled Humble "
+                "libraries instead, for example: "
+                "export ROS_DISTRO=humble; export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; "
+                "export LD_LIBRARY_PATH=$HOME/isaac-sim/exts/isaacsim.ros2.bridge/humble/lib; "
+                "export PYTHONPATH=$HOME/isaac-sim/exts/isaacsim.ros2.bridge/humble/rclpy. "
+                "For visual-only validation, rerun the validation script with --no-ros-bridge."
             ) from exc
 
         try:
@@ -219,16 +253,14 @@ class InternalIsaacRosBridge:
                     controller.max_angular_speed_rps,
                 )
             )
-            right_velocity = (
-                (2.0 * linear_x) + (angular_z * controller.wheel_distance_m)
-            ) / (2.0 * controller.wheel_radius_m)
-            left_velocity = (
-                (2.0 * linear_x) - (angular_z * controller.wheel_distance_m)
-            ) / (2.0 * controller.wheel_radius_m)
-
+            joint_indices, joint_velocities = _wheel_action_arrays(
+                controller,
+                linear_x=linear_x,
+                angular_z=angular_z,
+            )
             action = self._ArticulationAction(
-                joint_velocities=np.array([left_velocity, right_velocity], dtype=np.float32),
-                joint_indices=controller.wheel_joint_indices,
+                joint_velocities=joint_velocities,
+                joint_indices=joint_indices,
             )
             controller.articulation_controller.apply_action(action)
 
@@ -276,9 +308,14 @@ class InternalIsaacRosBridge:
                 math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
             )
 
+            joint_indices, joint_velocities = _wheel_action_arrays(
+                controller,
+                linear_x=0.0,
+                angular_z=0.0,
+            )
             zero_action = self._ArticulationAction(
-                joint_velocities=np.array([0.0, 0.0], dtype=np.float32),
-                joint_indices=controller.wheel_joint_indices,
+                joint_velocities=joint_velocities,
+                joint_indices=joint_indices,
             )
             controller.articulation_controller.apply_action(zero_action)
             set_xform_pose(

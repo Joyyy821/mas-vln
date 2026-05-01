@@ -15,6 +15,7 @@ from isaac_sim.stage_bringups.warehouse_randomized.instructions.forklift_near_sh
     select_focus_object,
 )
 from isaac_sim.stage_bringups.warehouse_randomized.maps import MapExportResult
+from isaac_sim.stage_bringups.warehouse_randomized.robot_teams import RobotTeamPolicy
 from isaac_sim.stage_bringups.warehouse_randomized.templates import (
     ObjectGroupSpec,
     ObjectRandomizationSpec,
@@ -66,6 +67,7 @@ def _make_template(tmpdir: str) -> WarehouseTemplate:
         object_randomizers=(),
         focus_group_names=("focus_objects",),
         focus_distance_range_m=(2.5, 5.0),
+        robot_team=RobotTeamPolicy(),
         metadata={"layout_class": "open"},
     )
 
@@ -555,6 +557,7 @@ class WarehouseRandomizedBuilderMetadataTests(unittest.TestCase):
                 object_randomizers=builder._template.object_randomizers,
                 focus_group_names=builder._template.focus_group_names,
                 focus_distance_range_m=builder._template.focus_distance_range_m,
+                robot_team=builder._template.robot_team,
                 metadata=builder._template.metadata,
             )
             builder._accepted_layout_bboxes = []

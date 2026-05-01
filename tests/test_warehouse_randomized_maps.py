@@ -276,6 +276,41 @@ class WarehouseRandomizedMapsTests(unittest.TestCase):
                 )
                 self.assertGreaterEqual(distance_to_focus, 6.0)
 
+    def test_rollout_sampler_preserves_per_rollout_robot_models(self) -> None:
+        occupancy_map = _free_occupancy_map(width=30, height=30)
+        robot_teams = [
+            [
+                {"name": "nova_carter", "model": "nova_carter"},
+                {"name": "carter_v1", "model": "carter_v1"},
+            ],
+            [
+                {"name": "nova_carter", "model": "nova_carter"},
+                {"name": "carter_v1", "model": "carter_v1"},
+                {"name": "jackal", "model": "jackal"},
+            ],
+        ]
+
+        rollouts, validation = sample_multi_robot_rollouts(
+            occupancy_map=occupancy_map,
+            robot_teams=robot_teams,
+            rollout_count=2,
+            rng=np.random.default_rng(11),
+            inflation_radius_m=0.0,
+            min_pairwise_distance_m=1.0,
+            min_goal_distance_m=2.0,
+        )
+
+        self.assertEqual(validation["rollout_robot_counts"], [2, 3])
+        self.assertEqual(
+            [robot["name"] for robot in rollouts[0]["robots"]],
+            ["nova_carter", "carter_v1"],
+        )
+        self.assertEqual(
+            [robot["model"] for robot in rollouts[1]["robots"]],
+            ["nova_carter", "carter_v1", "jackal"],
+        )
+        self.assertNotIn("robot1", [robot["name"] for robot in rollouts[1]["robots"]])
+
     def test_rollout_sampler_fails_when_focus_annulus_has_no_candidates(self) -> None:
         occupancy_map = _free_occupancy_map()
 
