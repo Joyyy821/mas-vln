@@ -123,10 +123,11 @@ class MapfTimedTracker(Node):
         self.declare_parameter("global_plan_topic", "global_plan")
         self.declare_parameter("control_frequency", 20.0)
         self.declare_parameter("mapf_step_duration", 0.5)
+        self.declare_parameter("max_translation_duration", 0.0)
         self.declare_parameter("goal_position_tolerance", 0.08)
         self.declare_parameter("goal_yaw_tolerance", 0.08)
         self.declare_parameter("pre_rotate_yaw_tolerance", 0.12)
-        self.declare_parameter("slow_down_radius", 0.4)
+        self.declare_parameter("slow_down_radius", 1.0)
         self.declare_parameter("tracking_longitudinal_kp", 1.6)
         self.declare_parameter("tracking_lateral_kp", 2.25)
         self.declare_parameter("tracking_yaw_kp", 1.5)
@@ -152,6 +153,10 @@ class MapfTimedTracker(Node):
         self._global_plan_topic = str(self.get_parameter("global_plan_topic").value)
         self._control_frequency = float(self.get_parameter("control_frequency").value)
         self._mapf_step_duration = float(self.get_parameter("mapf_step_duration").value)
+        self._configured_max_translation_duration = max(
+            float(self.get_parameter("max_translation_duration").value),
+            0.0,
+        )
         self._goal_position_tolerance = float(
             self.get_parameter("goal_position_tolerance").value
         )
@@ -391,10 +396,16 @@ class MapfTimedTracker(Node):
                     f"{self._agent_rotation_max_angular_speeds[agent_idx]:.3f} rad/s."
                 )
 
-        self._max_translation_duration = max(durations, default=0.0)
+        planned_max_translation_duration = max(durations, default=0.0)
+        self._max_translation_duration = max(
+            planned_max_translation_duration,
+            self._configured_max_translation_duration,
+        )
         duration_text = ", ".join(f"{duration:.2f}s" for duration in durations)
         self.get_logger().info(
             f"Loaded timed MAPF plan with per-agent translation durations [{duration_text}]. "
+            f"Configured max translation duration is {self._configured_max_translation_duration:.2f}s; "
+            f"using global translation horizon {self._max_translation_duration:.2f}s. "
             "Waiting for all agents to finish pre-rotation before starting the shared clock."
         )
         self._log_reference_separation()
@@ -441,7 +452,6 @@ class MapfTimedTracker(Node):
 
         assert self._trajectory_start_time is not None
         elapsed = max((now - self._trajectory_start_time).nanoseconds / 1e9, 0.0)
-        translation_phase_complete = elapsed >= self._max_translation_duration
 
         for agent_idx, trajectory in enumerate(self._trajectories):
             if trajectory is None or self._completed[agent_idx]:
@@ -450,19 +460,34 @@ class MapfTimedTracker(Node):
 
             phase = self._phases[agent_idx]
             if phase == "track":
-                if self._track_agent(agent_idx, trajectory, elapsed, dt, translation_phase_complete):
+                if self._track_agent(
+                    agent_idx,
+                    trajectory,
+                    elapsed,
+                    dt,
+                    phase_label="track",
+                ):
+                    self._finish_agent_translation(agent_idx, trajectory)
+                    continue
+
+                if elapsed >= trajectory.translation_duration:
+                    self._phases[agent_idx] = "final_approach"
                     self._reset_integrator(agent_idx)
-                    if trajectory.final_goal_yaw is None:
-                        self._completed[agent_idx] = True
-                        self._phases[agent_idx] = "done"
-                        self._publish_zero(agent_idx)
-                        self._log_tracking_error_summary(agent_idx, trajectory)
-                    else:
-                        self._phases[agent_idx] = "post_rotate"
-                        self._publish_zero(agent_idx)
-                        self.get_logger().info(
-                            f"Agent {agent_idx} reached timed translation target and is starting post-rotation."
-                        )
+                    self.get_logger().info(
+                        f"Agent {agent_idx} finished its timed reference path and is approaching "
+                        "the final translation target."
+                    )
+                continue
+
+            if phase == "final_approach":
+                if self._track_agent(
+                    agent_idx,
+                    trajectory,
+                    elapsed,
+                    dt,
+                    phase_label="final_approach",
+                ):
+                    self._finish_agent_translation(agent_idx, trajectory)
                 continue
 
             if phase == "post_rotate":
@@ -491,6 +516,21 @@ class MapfTimedTracker(Node):
             self._publish_zero_to_all()
             self._publish_execution_status("succeeded")
             self._start_pending_plan()
+
+    def _finish_agent_translation(self, agent_idx: int, trajectory: AgentTrajectory) -> None:
+        self._reset_integrator(agent_idx)
+        if trajectory.final_goal_yaw is None:
+            self._completed[agent_idx] = True
+            self._phases[agent_idx] = "done"
+            self._publish_zero(agent_idx)
+            self._log_tracking_error_summary(agent_idx, trajectory)
+            return
+
+        self._phases[agent_idx] = "post_rotate"
+        self._publish_zero(agent_idx)
+        self.get_logger().info(
+            f"Agent {agent_idx} reached final translation target and is starting post-rotation."
+        )
 
     def _reset_execution_state(self, reason: str | None = None) -> None:
         had_execution_state = (
@@ -594,7 +634,8 @@ class MapfTimedTracker(Node):
         trajectory: AgentTrajectory,
         elapsed: float,
         dt: float,
-        translation_phase_complete: bool,
+        *,
+        phase_label: str,
     ) -> bool:
         pose = self._lookup_robot_pose(agent_idx)
         if pose is None:
@@ -607,15 +648,12 @@ class MapfTimedTracker(Node):
             return True
 
         final_distance = self._distance(pose[0], pose[1], final_sample.x, final_sample.y)
-        if translation_phase_complete and final_distance <= self._goal_position_tolerance:
+        if final_distance <= self._goal_position_tolerance:
             self._publish_zero(agent_idx)
             return True
 
         ref = self._sample_trajectory(trajectory, elapsed)
-        if (
-            elapsed >= trajectory.translation_duration
-            and final_distance <= self._slow_down_radius
-        ):
+        if final_distance <= self._slow_down_radius:
             ref = ReferenceState(
                 x=ref.x,
                 y=ref.y,
@@ -690,7 +728,7 @@ class MapfTimedTracker(Node):
         self._tracking_log_rows[agent_idx].append(
             {
                 "elapsed": elapsed,
-                "phase": "track",
+                "phase": phase_label,
                 "ref_x": ref.x,
                 "ref_y": ref.y,
                 "ref_yaw": ref.yaw,

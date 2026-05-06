@@ -20,7 +20,7 @@ mapf_base:
         inflation_layer:
           plugin: "nav2_costmap_2d::InflationLayer"
           enabled: true
-          inflation_radius: 0.6
+          inflation_radius: 0.8
           cost_scaling_factor: 3.0
 
         always_send_full_costmap: true
