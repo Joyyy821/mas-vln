@@ -17,6 +17,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.time import Time
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from carters_goal.rollout_control import parse_rollout_id
@@ -94,6 +95,7 @@ def _rollout_to_legacy_team_config(
         "robots": [
             {
                 "name": str(robot["name"]),
+                "model": str(robot.get("model", "") or robot["name"]),
                 "initial_pose": _pose_array_to_legacy_pose_dict(robot["initial_pose"]),
                 "goal_pose": _pose_array_to_legacy_pose_dict(robot["goal_pose"]),
             }
@@ -112,6 +114,7 @@ class RobotVelocityRecorder(Node):
         self.declare_parameter("record_frequency_hz", 20.0)
         self.declare_parameter("experiments_dir", "")
         self.declare_parameter("rollout_control_topic", "")
+        self.declare_parameter("execution_status_topic", "/mapf_base/plan_execution_status")
         self.declare_parameter("global_frame_id", "map")
         self.declare_parameter("base_frame_suffix", "base_link")
 
@@ -149,6 +152,9 @@ class RobotVelocityRecorder(Node):
             self._experiments_dir, self._team_config_path
         )
         self._rollout_control_topic = str(self.get_parameter("rollout_control_topic").value).strip()
+        self._execution_status_topic = str(
+            self.get_parameter("execution_status_topic").value
+        ).strip()
         self._global_frame_id = str(self.get_parameter("global_frame_id").value).strip() or "map"
         self._base_frame_suffix = (
             str(self.get_parameter("base_frame_suffix").value).strip() or "base_link"
@@ -164,6 +170,11 @@ class RobotVelocityRecorder(Node):
         self._sample_counts = {name: 0 for name in self._robot_namespaces}
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
         self._last_tf_warn_ns = {name: 0 for name in self._robot_namespaces}
+        self._recording_enabled_by_robot = {name: False for name in self._robot_namespaces}
+        self._recording_started_at_ns: int | None = None
+        self._robot_recording_finished_at_ns: dict[str, int | None] = {
+            name: None for name in self._robot_namespaces
+        }
         self._file_handles: dict[str, Any] = {}
         self._csv_writers: dict[str, csv.writer] = {}
         self._file_paths: dict[str, Path] = {}
@@ -200,6 +211,21 @@ class RobotVelocityRecorder(Node):
         else:
             default_rollout_id = int(self._team_config["first_rollout"]["id"])
             self._activate_rollout(default_rollout_id, use_legacy_directory=True)
+
+        self._execution_status_sub = None
+        if self._execution_status_topic:
+            self._execution_status_sub = self.create_subscription(
+                String,
+                self._execution_status_topic,
+                self._execution_status_callback,
+                10,
+            )
+            self.get_logger().info(
+                "Velocity samples will start on execution status 'active' and stop per robot "
+                f"on agent_done events from {self._execution_status_topic}."
+            )
+        else:
+            self._start_recording_all("no execution_status_topic configured")
 
     def _rollout_control_callback(self, msg: PoseArray) -> None:
         rollout_id = parse_rollout_id(msg.header.frame_id)
@@ -269,6 +295,11 @@ class RobotVelocityRecorder(Node):
         self._sample_counts = {name: 0 for name in self._robot_namespaces}
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
         self._last_tf_warn_ns = {name: 0 for name in self._robot_namespaces}
+        self._recording_enabled_by_robot = {name: False for name in self._robot_namespaces}
+        self._recording_started_at_ns = None
+        self._robot_recording_finished_at_ns = {
+            name: None for name in self._robot_namespaces
+        }
         self._file_handles = {}
         self._csv_writers = {}
         self._file_paths = {}
@@ -285,9 +316,11 @@ class RobotVelocityRecorder(Node):
 
         self._write_metadata()
         self.get_logger().info(
-            "Recording simulator odometry pose/velocity samples for rollout "
-            f"{rollout_id} into {run_dir}."
+            "Prepared simulator odometry pose/velocity recording for rollout "
+            f"{rollout_id} in {run_dir}. Waiting for execution start before writing samples."
         )
+        if not self._execution_status_topic:
+            self._start_recording_all("no execution_status_topic configured")
 
     def _close_active_rollout(self) -> None:
         if self._run_dir is None:
@@ -309,8 +342,82 @@ class RobotVelocityRecorder(Node):
         self._csv_writers = {}
         self._file_paths = {}
 
+    def _execution_status_callback(self, msg: String) -> None:
+        status = str(msg.data).strip()
+        normalized_status = status.lower()
+        if not normalized_status:
+            return
+
+        if normalized_status == "active":
+            self._start_recording_all("execution status active")
+            return
+
+        if normalized_status.startswith("agent_done:") or normalized_status.startswith("agent_finished:"):
+            _, robot_name = status.split(":", 1)
+            self._finish_robot_recording(robot_name.strip(), status)
+            return
+
+        if normalized_status in {"succeeded", "failed"}:
+            self._finish_all_recording(status)
+            self._close_active_rollout()
+
+    def _start_recording_all(self, reason: str) -> None:
+        if self._active_rollout_id is None:
+            return
+        if self._recording_started_at_ns is not None:
+            return
+
+        self._recording_started_at_ns = self.get_clock().now().nanoseconds
+        self._recording_enabled_by_robot = {
+            name: True for name in self._robot_namespaces
+        }
+        self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
+        self._write_metadata()
+        self.get_logger().info(
+            f"Started velocity recording for rollout {self._active_rollout_id} "
+            f"at {self._recording_started_at_ns} ns ({reason})."
+        )
+
+    def _finish_robot_recording(self, robot_name: str, reason: str) -> None:
+        if self._active_rollout_id is None:
+            return
+        normalized_name = robot_name.strip("/")
+        if normalized_name not in self._recording_enabled_by_robot:
+            return
+        if self._robot_recording_finished_at_ns.get(normalized_name) is not None:
+            return
+
+        self._recording_enabled_by_robot[normalized_name] = False
+        self._robot_recording_finished_at_ns[normalized_name] = self.get_clock().now().nanoseconds
+        file_handle = self._file_handles.get(normalized_name)
+        if file_handle is not None:
+            file_handle.flush()
+        self._write_metadata()
+        self.get_logger().info(
+            f"Stopped velocity recording for rollout {self._active_rollout_id} robot "
+            f"{normalized_name} at {self._robot_recording_finished_at_ns[normalized_name]} ns "
+            f"({reason})."
+        )
+
+    def _finish_all_recording(self, reason: str) -> None:
+        if self._active_rollout_id is None:
+            return
+        for namespace in self._robot_namespaces:
+            if self._robot_recording_finished_at_ns.get(namespace) is None:
+                self._recording_enabled_by_robot[namespace] = False
+                self._robot_recording_finished_at_ns[namespace] = self.get_clock().now().nanoseconds
+                file_handle = self._file_handles.get(namespace)
+                if file_handle is not None:
+                    file_handle.flush()
+        self._write_metadata()
+        self.get_logger().info(
+            f"Finished velocity recording for rollout {self._active_rollout_id} ({reason})."
+        )
+
     def _odom_callback(self, robot_name: str, msg: Odometry) -> None:
         if self._active_rollout_id is None:
+            return
+        if not self._recording_enabled_by_robot.get(robot_name, False):
             return
 
         stamp_ns = _stamp_to_nanoseconds(msg)
@@ -406,6 +513,9 @@ class RobotVelocityRecorder(Node):
                 "base_frame_suffix": self._base_frame_suffix,
                 "timestamp_units": "nanoseconds",
                 "message_type": "nav_msgs/msg/Odometry",
+                "start_trigger": "execution_status:active",
+                "per_robot_stop_trigger": "execution_status:agent_done:<robot_name>",
+                "recording_started_at_ns": self._recording_started_at_ns,
             },
             "team_config": team_config_snapshot,
             "artifacts": {
@@ -418,6 +528,9 @@ class RobotVelocityRecorder(Node):
                     "base_frame_id": self._base_frame_ids[namespace],
                     "recording_file": self._file_paths[namespace].name,
                     "sample_count": self._sample_counts[namespace],
+                    "recording_active": self._recording_enabled_by_robot.get(namespace, False),
+                    "recording_started_at_ns": self._recording_started_at_ns,
+                    "recording_finished_at_ns": self._robot_recording_finished_at_ns.get(namespace),
                 }
                 for namespace in self._robot_namespaces
             ],

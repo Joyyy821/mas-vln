@@ -48,6 +48,7 @@ class TrackerSample:
 @dataclass(frozen=True)
 class RolloutRobotData:
     name: str
+    model: str
     initial_pose: RobotPose
     goal_pose: RobotPose
     velocity_path: Path
@@ -143,12 +144,19 @@ def load_rollout(rollout_dir: str | Path) -> RolloutData:
     if not robot_configs:
         raise ValueError(f"No robots are defined in {run_config_path}.")
 
+    rollout_id_hint = _resolve_rollout_id(run_config.get("run_id"), rollout_path)
+    model_by_robot_name = _load_bundle_team_model_lookup(rollout_path, rollout_id_hint)
+
     robots: list[RolloutRobotData] = []
     replay_timestamps: set[int] = set()
     for robot_config in robot_configs:
         name = str(robot_config.get("name", "")).strip()
         if not name:
             raise ValueError(f"Encountered a robot entry without a name in {run_config_path}.")
+        model = (
+            str(robot_config.get("model", "") or model_by_robot_name.get(name, "") or name).strip()
+            or name
+        )
 
         velocity_path = rollout_path / f"{name}_velocity.csv"
         if not velocity_path.is_file():
@@ -160,6 +168,7 @@ def load_rollout(rollout_dir: str | Path) -> RolloutData:
         robots.append(
             RolloutRobotData(
                 name=name,
+                model=model,
                 initial_pose=_pose_from_config(robot_config.get("initial_pose"), f"{name}.initial_pose"),
                 goal_pose=_pose_from_config(robot_config.get("goal_pose"), f"{name}.goal_pose"),
                 velocity_path=velocity_path,
@@ -169,9 +178,8 @@ def load_rollout(rollout_dir: str | Path) -> RolloutData:
             )
         )
 
-    rollout_id = _resolve_rollout_id(run_config.get("run_id"), rollout_path)
     return RolloutData(
-        rollout_id=rollout_id,
+        rollout_id=rollout_id_hint,
         rollout_dir=rollout_path,
         run_config_path=run_config_path,
         created_at=str(run_config.get("created_at", "") or ""),
@@ -183,6 +191,32 @@ def load_rollout(rollout_dir: str | Path) -> RolloutData:
     )
 
 
+def _load_bundle_team_model_lookup(rollout_path: Path, rollout_id: int) -> dict[str, str]:
+    team_config_path = rollout_path.parent.parent / "team_config.yaml"
+    if not team_config_path.is_file():
+        return {}
+
+    with team_config_path.open("r", encoding="utf-8") as stream:
+        team_config = yaml.safe_load(stream) or {}
+
+    rollout_robots = None
+    for rollout_config in list(team_config.get("rollouts", []) or []):
+        try:
+            candidate_rollout_id = int(rollout_config.get("id", -1))
+        except (TypeError, ValueError):
+            continue
+        if candidate_rollout_id == int(rollout_id):
+            rollout_robots = list(rollout_config.get("robots", []) or [])
+            break
+    if rollout_robots is None:
+        rollout_robots = list(team_config.get("robots", []) or [])
+    return {
+        str(robot.get("name", "")).strip(): str(robot.get("model", "")).strip()
+        for robot in rollout_robots
+        if str(robot.get("name", "")).strip() and str(robot.get("model", "")).strip()
+    }
+
+
 @contextmanager
 def temporary_team_config_file(rollout: RolloutData) -> Iterator[Path]:
     environment = dict(rollout.team_config_snapshot.get("environment", {}) or {})
@@ -192,6 +226,7 @@ def temporary_team_config_file(rollout: RolloutData) -> Iterator[Path]:
         "robots": [
             {
                 "name": robot.name,
+                "model": robot.model,
                 "initial_pose": pose_to_dict(robot.initial_pose),
                 "goal_pose": pose_to_dict(robot.goal_pose),
             }
@@ -214,6 +249,43 @@ def temporary_team_config_file(rollout: RolloutData) -> Iterator[Path]:
             temp_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def resolve_rollout_scene_usd_path(rollout: RolloutData) -> Path:
+    """Resolve the randomized scene USD colocated with a recorded rollout."""
+
+    candidate_bundle_dir = rollout.rollout_dir.parent.parent
+    bundle_scene_usd = candidate_bundle_dir / "scene.usd"
+    if bundle_scene_usd.is_file():
+        return bundle_scene_usd.resolve()
+
+    snapshot_usd_path = str(rollout.team_config_snapshot.get("usd_path", "") or "").strip()
+    if snapshot_usd_path:
+        candidate = Path(snapshot_usd_path).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+        colocated_candidate = candidate_bundle_dir / candidate.name
+        if colocated_candidate.is_file():
+            return colocated_candidate.resolve()
+
+    team_config_path = candidate_bundle_dir / "team_config.yaml"
+    if team_config_path.is_file():
+        with team_config_path.open("r", encoding="utf-8") as stream:
+            team_config = yaml.safe_load(stream) or {}
+        team_config_usd_path = str(team_config.get("usd_path", "") or "").strip()
+        if team_config_usd_path:
+            candidate = Path(team_config_usd_path).expanduser()
+            if candidate.is_file():
+                return candidate.resolve()
+            colocated_candidate = team_config_path.parent / candidate.name
+            if colocated_candidate.is_file():
+                return colocated_candidate.resolve()
+
+    raise FileNotFoundError(
+        "Unable to resolve scene.usd for rollout "
+        f"{rollout.rollout_id} under {rollout.rollout_dir}. Expected {bundle_scene_usd} "
+        "or a valid usd_path in team_config.yaml."
+    )
 
 
 def pose_to_dict(pose: RobotPose) -> dict[str, float]:

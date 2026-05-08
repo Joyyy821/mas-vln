@@ -1,0 +1,82 @@
+output_resolution: [224, 224]
+
+robot_camera:
+  mode: asset_if_available
+  asset_camera_reject_tokens:
+    - third_person
+    - third-person
+    - rear
+    - follow
+    - external
+    - debug
+  fallback_virtual_camera:
+    prim_name: RenderFallbackCamera
+    position_xyz: [0.35, 0.0, 0.75]
+    target_xyz: [2.0, 0.0, 0.45]
+    up_axis: [0.0, 0.0, 1.0]
+    focal_length_mm: 8.0
+    horizontal_aperture_mm: 20.0
+    vertical_aperture_mm: 20.0
+    clipping_range_m: [0.05, 100.0]
+  model_overrides:
+    limo:
+      mode: virtual_only
+      prim_name: RenderFallbackCamera
+      position_xyz:
+      - 0.102658
+      - -0.000433
+      - 0.016581
+      target_xyz:
+      - 1.752658
+      - -0.000433
+      - -0.283419
+      up_axis:
+      - 0.178885
+      - -0.0
+      - 0.98387
+      focal_length_mm: 12.0
+      horizontal_aperture_mm: 20.0
+      vertical_aperture_mm: 20.0
+      clipping_range_m:
+      - 0.05000000074505806
+      - 100.0
+
+bev_cameras:
+- name: half_south
+  position_xyz:
+  - 0.0
+  - -4.3
+  - 6.5
+  target_xyz:
+  - 0.0
+  - -4.3
+  - 0.0
+  up_axis:
+  - 0.0
+  - 1.0
+  - 0.0
+  focal_length_mm: 8.0
+  horizontal_aperture_mm: 24.0
+  vertical_aperture_mm: 24.0
+  clipping_range_m:
+  - 0.1
+  - 100.0
+- name: half_north
+  position_xyz:
+  - 0.0
+  - 10.1
+  - 6.5
+  target_xyz:
+  - 0.0
+  - 10.1
+  - 0.0
+  up_axis:
+  - 0.0
+  - 1.0
+  - 0.0
+  focal_length_mm: 8.0
+  horizontal_aperture_mm: 24.0
+  vertical_aperture_mm: 24.0
+  clipping_range_m:
+  - 0.1
+  - 100.0

@@ -292,6 +292,7 @@ class MapfTimedTracker(Node):
         self._integral_x = [0.0 for _ in range(self._agent_num)]
         self._integral_y = [0.0 for _ in range(self._agent_num)]
         self._integral_yaw = [0.0 for _ in range(self._agent_num)]
+        self._agent_done_status_published = [False for _ in range(self._agent_num)]
         self._last_control_time: Time | None = None
         self._execution_index = 0
 
@@ -372,6 +373,7 @@ class MapfTimedTracker(Node):
         self._tracking_summary_logged = [False for _ in range(self._agent_num)]
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
         self._rotation_states = [None for _ in range(self._agent_num)]
+        self._agent_done_status_published = [False for _ in range(self._agent_num)]
         self._reset_all_integrators()
         self._publish_execution_status("active")
 
@@ -504,6 +506,7 @@ class MapfTimedTracker(Node):
                         f"Agent {agent_idx} finished its final in-place rotation."
                     )
                     self._log_tracking_error_summary(agent_idx, trajectory)
+                    self._publish_agent_done_status(agent_idx)
                 continue
 
             self._publish_zero(agent_idx)
@@ -524,6 +527,7 @@ class MapfTimedTracker(Node):
             self._phases[agent_idx] = "done"
             self._publish_zero(agent_idx)
             self._log_tracking_error_summary(agent_idx, trajectory)
+            self._publish_agent_done_status(agent_idx)
             return
 
         self._phases[agent_idx] = "post_rotate"
@@ -555,6 +559,7 @@ class MapfTimedTracker(Node):
         self._tracking_summary_logged = [False for _ in range(self._agent_num)]
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
         self._rotation_states = [None for _ in range(self._agent_num)]
+        self._agent_done_status_published = [False for _ in range(self._agent_num)]
         self._reset_all_integrators()
         self._publish_zero_to_all()
 
@@ -1086,6 +1091,14 @@ class MapfTimedTracker(Node):
         msg = String()
         msg.data = status
         self._execution_status_pub.publish(msg)
+
+    def _publish_agent_done_status(self, agent_idx: int) -> None:
+        if agent_idx < 0 or agent_idx >= self._agent_num:
+            return
+        if self._agent_done_status_published[agent_idx]:
+            return
+        self._agent_done_status_published[agent_idx] = True
+        self._publish_execution_status(f"agent_done:{self._agent_names[agent_idx]}")
 
     def _rollout_control_callback(self, msg: PoseArray) -> None:
         rollout_id = parse_rollout_id(msg.header.frame_id)
