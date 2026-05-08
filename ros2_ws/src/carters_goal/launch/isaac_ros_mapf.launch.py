@@ -57,6 +57,7 @@ _TIMED_TRACKER_DEFAULT_PROFILE = {
     "agent_tracking_lateral_kp": 0.30,
     "agent_tracking_yaw_kp": 0.40,
     "agent_integral_limit": 0.0,
+    "agent_allow_reverse_final_approach": False,
 }
 
 _TIMED_TRACKER_MODEL_PROFILES = {
@@ -89,6 +90,7 @@ _TIMED_TRACKER_MODEL_PROFILES = {
         "agent_tracking_lateral_kp": 2.0,
         "agent_tracking_yaw_kp": 1.2,
         "agent_integral_limit": 0.0,
+        "agent_allow_reverse_final_approach": True,
     },
     "limo": {
         "agent_max_linear_speed": 0.08,
@@ -99,6 +101,7 @@ _TIMED_TRACKER_MODEL_PROFILES = {
         "agent_tracking_lateral_kp": 4.0,
         "agent_tracking_yaw_kp": 3.0,
         "agent_integral_limit": 0.0,
+        "agent_allow_reverse_final_approach": True,
     },
 }
 
@@ -210,6 +213,7 @@ def _launch_setup(context, *args, **kwargs):
     record_frequency_hz = LaunchConfiguration("record_frequency_hz")
     record_odom_topic_suffix = LaunchConfiguration("record_odom_topic_suffix")
     experiments_dir = LaunchConfiguration("experiments_dir")
+    overwrite_existing_rollout = LaunchConfiguration("overwrite_existing_rollout")
     core_startup_delay = LaunchConfiguration("core_startup_delay")
     lifecycle_manager_delay = LaunchConfiguration("lifecycle_manager_delay")
     run_goal_publisher = LaunchConfiguration("run_goal_publisher")
@@ -333,6 +337,8 @@ def _launch_setup(context, *args, **kwargs):
                 "odom_topic_suffix": record_odom_topic_suffix,
                 "record_frequency_hz": record_frequency_hz,
                 "experiments_dir": experiments_dir,
+                "rollout_id": rollout_id or 0,
+                "overwrite_existing": overwrite_existing_rollout,
                 "rollout_control_topic": rollout_control_topic,
                 "execution_status_topic": execution_status_topic,
             }
@@ -393,6 +399,7 @@ def _launch_setup(context, *args, **kwargs):
                         "rollout_control_topic": rollout_control_topic,
                         "team_config_file": team_config_path,
                         "experiments_dir": experiments_dir,
+                        "rollout_id": rollout_id or 0,
                     },
                 ],
             )
@@ -496,6 +503,14 @@ def generate_launch_description():
             "Defaults to <repo>/experiments."
         ),
     )
+    overwrite_existing_rollout_arg = DeclareLaunchArgument(
+        "overwrite_existing_rollout",
+        default_value="false",
+        description=(
+            "Allow RobotVelocityRecorder to replace the selected rollout output directory. "
+            "The randomized warehouse batch runner enables this for retryable collection."
+        ),
+    )
     core_startup_delay_arg = DeclareLaunchArgument(
         "core_startup_delay",
         default_value="1.0",
@@ -582,6 +597,7 @@ def generate_launch_description():
             record_frequency_arg,
             record_odom_topic_suffix_arg,
             experiments_dir_arg,
+            overwrite_existing_rollout_arg,
             core_startup_delay_arg,
             lifecycle_manager_delay_arg,
             run_goal_pub_arg,

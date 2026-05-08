@@ -7,67 +7,49 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
     carters_goal_dir = get_package_share_directory("carters_goal")
-    carters_nav2_dir = get_package_share_directory("carters_nav2")
 
-    base_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(carters_goal_dir, "launch", "isaac_ros_mapf.launch.py")
-        ),
-        launch_arguments={
-            "map": LaunchConfiguration("map"),
-            "team_config_file": LaunchConfiguration("team_config_file"),
-            "mapf_params_file": LaunchConfiguration("mapf_params_file"),
-            "mapf_costmap_params_file": LaunchConfiguration("mapf_costmap_params_file"),
-            "initial_pose_tf_params_file": LaunchConfiguration("initial_pose_tf_params_file"),
-            "use_sim_time": LaunchConfiguration("use_sim_time"),
-            "autostart": LaunchConfiguration("autostart"),
-            "mapf_planner": LaunchConfiguration("mapf_planner"),
-            "record_velocity": LaunchConfiguration("record_velocity"),
-            "record_frequency_hz": LaunchConfiguration("record_frequency_hz"),
-            "record_odom_topic_suffix": LaunchConfiguration("record_odom_topic_suffix"),
-            "experiments_dir": LaunchConfiguration("experiments_dir"),
-            "core_startup_delay": LaunchConfiguration("core_startup_delay"),
-            "lifecycle_manager_delay": LaunchConfiguration("lifecycle_manager_delay"),
-            "run_goal_publisher": "false",
-            "goal_publisher_delay": LaunchConfiguration("goal_publisher_delay"),
-            "run_tf_bridge": LaunchConfiguration("run_tf_bridge"),
-            "run_initial_pose_tf": LaunchConfiguration("run_initial_pose_tf"),
-            "run_plan_executor": LaunchConfiguration("run_plan_executor"),
-            "execution_backend": LaunchConfiguration("execution_backend"),
-            "plan_executor_delay": LaunchConfiguration("plan_executor_delay"),
-            "rollout_control_topic": LaunchConfiguration("rollout_control_topic"),
-            "rollout_reset_done_topic": LaunchConfiguration("rollout_reset_done_topic"),
-            "execution_status_topic": LaunchConfiguration("execution_status_topic"),
-        }.items(),
-    )
-
-    rollout_manager = Node(
+    batch_runner = Node(
         package="carters_goal",
-        executable="RolloutManager",
-        name="rollout_manager",
+        executable="RandomizedWarehouseBatchRunner",
+        name="randomized_warehouse_batch_runner",
         output="screen",
         parameters=[
             {
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
-                "team_config_file": LaunchConfiguration("team_config_file"),
-                "experiments_dir": LaunchConfiguration("experiments_dir"),
-                "rollout_control_topic": LaunchConfiguration("rollout_control_topic"),
-                "rollout_reset_done_topic": LaunchConfiguration("rollout_reset_done_topic"),
-                "execution_status_topic": LaunchConfiguration("execution_status_topic"),
-                "skip_existed_rollout": LaunchConfiguration("skip_existed_rollout"),
-                "reset_timeout_sec": LaunchConfiguration("reset_timeout_sec"),
+                "scene_root_dir": LaunchConfiguration("scene_root_dir"),
+                "continue": LaunchConfiguration("continue"),
+                "continue_scene_id": LaunchConfiguration("continue_scene_id"),
+                "continue_rollout_id": LaunchConfiguration("continue_rollout_id"),
+                "max_rerun": LaunchConfiguration("max_rerun"),
+                "scene_control_topic": LaunchConfiguration("scene_control_topic"),
+                "scene_ready_topic": LaunchConfiguration("scene_ready_topic"),
+                "scene_ready_timeout_sec": LaunchConfiguration("scene_ready_timeout_sec"),
                 "execution_timeout_sec": LaunchConfiguration("execution_timeout_sec"),
-                "post_rollout_delay_sec": LaunchConfiguration("post_rollout_delay_sec"),
-                "goal_publish_period_sec": LaunchConfiguration("goal_publish_period_sec"),
-                "wait_for_mapf_active": LaunchConfiguration("wait_for_mapf_active"),
+                "status_topic": LaunchConfiguration("execution_status_topic"),
+                "mapf_params_file": LaunchConfiguration("mapf_params_file"),
+                "mapf_costmap_params_file": LaunchConfiguration("mapf_costmap_params_file"),
+                "initial_pose_tf_params_file": LaunchConfiguration("initial_pose_tf_params_file"),
+                "autostart": LaunchConfiguration("autostart"),
+                "mapf_planner": LaunchConfiguration("mapf_planner"),
+                "record_velocity": LaunchConfiguration("record_velocity"),
+                "record_frequency_hz": LaunchConfiguration("record_frequency_hz"),
+                "record_odom_topic_suffix": LaunchConfiguration("record_odom_topic_suffix"),
+                "experiments_dir": LaunchConfiguration("experiments_dir"),
+                "core_startup_delay": LaunchConfiguration("core_startup_delay"),
+                "lifecycle_manager_delay": LaunchConfiguration("lifecycle_manager_delay"),
+                "goal_publisher_delay": LaunchConfiguration("goal_publisher_delay"),
+                "run_tf_bridge": LaunchConfiguration("run_tf_bridge"),
+                "run_initial_pose_tf": LaunchConfiguration("run_initial_pose_tf"),
+                "run_plan_executor": LaunchConfiguration("run_plan_executor"),
+                "execution_backend": LaunchConfiguration("execution_backend"),
+                "plan_executor_delay": LaunchConfiguration("plan_executor_delay"),
             }
         ],
     )
@@ -75,19 +57,52 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "map",
+                "scene_root_dir",
                 default_value="",
-                description="Optional full path to the map yaml for MAPF.",
+                description=(
+                    "Directory containing scene_<n> randomized warehouse bundles. "
+                    "Each bundle must contain scene.usd, mapf_map.yaml, and team_config.yaml."
+                ),
             ),
             DeclareLaunchArgument(
-                "team_config_file",
-                default_value=os.path.join(
-                    carters_nav2_dir,
-                    "config",
-                    "warehouse",
-                    "warehouse_forklift.yaml",
-                ),
-                description="Full path to the rollout configuration YAML.",
+                "continue",
+                default_value="false",
+                description="Continue from continue_scene_id / continue_rollout_id.",
+            ),
+            DeclareLaunchArgument(
+                "continue_scene_id",
+                default_value="",
+                description="Scene id such as scene_11 when continue:=true.",
+            ),
+            DeclareLaunchArgument(
+                "continue_rollout_id",
+                default_value="0",
+                description="Rollout id within continue_scene_id when continue:=true.",
+            ),
+            DeclareLaunchArgument(
+                "max_rerun",
+                default_value="2",
+                description="Number of retries after the first failed attempt for each rollout.",
+            ),
+            DeclareLaunchArgument(
+                "scene_control_topic",
+                default_value="/carters_goal/batch_scene_control",
+                description="JSON String topic used to ask Isaac Sim to load/spawn a rollout.",
+            ),
+            DeclareLaunchArgument(
+                "scene_ready_topic",
+                default_value="/carters_goal/batch_scene_ready",
+                description="JSON String acknowledgement topic from the Isaac Sim batch server.",
+            ),
+            DeclareLaunchArgument(
+                "scene_ready_timeout_sec",
+                default_value="60.0",
+                description="How long to wait for Isaac Sim to acknowledge scene/robot readiness.",
+            ),
+            DeclareLaunchArgument(
+                "execution_timeout_sec",
+                default_value="900.0",
+                description="Hard wall-clock timeout for one child single-rollout launch attempt.",
             ),
             DeclareLaunchArgument(
                 "mapf_params_file",
@@ -97,14 +112,18 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "mapf_costmap_params_file",
                 default_value=os.path.join(
-                    carters_goal_dir, "config", "mapf_costmap_params_isaac.yaml"
+                    carters_goal_dir,
+                    "config",
+                    "mapf_costmap_params_isaac.yaml",
                 ),
                 description="Base MAPF costmap params YAML.",
             ),
             DeclareLaunchArgument(
                 "initial_pose_tf_params_file",
                 default_value=os.path.join(
-                    carters_goal_dir, "config", "initial_pose_tf_params_isaac.yaml"
+                    carters_goal_dir,
+                    "config",
+                    "initial_pose_tf_params_isaac.yaml",
                 ),
                 description="Base initial pose TF params YAML.",
             ),
@@ -121,54 +140,13 @@ def generate_launch_description():
             DeclareLaunchArgument("run_tf_bridge", default_value="true"),
             DeclareLaunchArgument("run_initial_pose_tf", default_value="true"),
             DeclareLaunchArgument("run_plan_executor", default_value="true"),
-            DeclareLaunchArgument("execution_backend", default_value="tracker"),
+            DeclareLaunchArgument("execution_backend", default_value="timed_tracker"),
             DeclareLaunchArgument("plan_executor_delay", default_value="1.5"),
-            DeclareLaunchArgument(
-                "rollout_control_topic",
-                default_value="/carters_goal/rollout_control",
-                description="PoseArray control topic for rollout resets and recorder/log switching.",
-            ),
-            DeclareLaunchArgument(
-                "rollout_reset_done_topic",
-                default_value="/carters_goal/rollout_reset_done",
-                description="Int32 acknowledgement topic published by Isaac Sim after a reset.",
-            ),
             DeclareLaunchArgument(
                 "execution_status_topic",
                 default_value="/mapf_base/plan_execution_status",
                 description="Status topic published by the active MAPF executor.",
             ),
-            DeclareLaunchArgument(
-                "skip_existed_rollout",
-                default_value="false",
-                description="Skip rollouts whose output directory already exists.",
-            ),
-            DeclareLaunchArgument(
-                "goal_publish_period_sec",
-                default_value="0.5",
-                description="How often to re-publish rollout goals until planning starts.",
-            ),
-            DeclareLaunchArgument(
-                "reset_timeout_sec",
-                default_value="15.0",
-                description="How long to wait for Isaac Sim to acknowledge a rollout reset.",
-            ),
-            DeclareLaunchArgument(
-                "execution_timeout_sec",
-                default_value="300.0",
-                description="How long to wait for one rollout to finish execution.",
-            ),
-            DeclareLaunchArgument(
-                "post_rollout_delay_sec",
-                default_value="1.0",
-                description="Pause between finished rollout k and rollout k+1.",
-            ),
-            DeclareLaunchArgument(
-                "wait_for_mapf_active",
-                default_value="true",
-                description="Wait for the lifecycle-managed MAPF node to become active before starting.",
-            ),
-            base_launch,
-            rollout_manager,
+            batch_runner,
         ]
     )

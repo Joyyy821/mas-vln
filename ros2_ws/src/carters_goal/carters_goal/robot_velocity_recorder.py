@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,12 @@ def _pose_array_to_legacy_pose_dict(pose_array: list[float]) -> dict[str, float]
     }
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _rollout_to_legacy_team_config(
     team_config: dict[str, Any],
     rollout: dict[str, Any],
@@ -113,6 +120,8 @@ class RobotVelocityRecorder(Node):
         self.declare_parameter("odom_topic_suffix", "chassis/odom")
         self.declare_parameter("record_frequency_hz", 20.0)
         self.declare_parameter("experiments_dir", "")
+        self.declare_parameter("rollout_id", 0)
+        self.declare_parameter("overwrite_existing", False)
         self.declare_parameter("rollout_control_topic", "")
         self.declare_parameter("execution_status_topic", "/mapf_base/plan_execution_status")
         self.declare_parameter("global_frame_id", "map")
@@ -151,6 +160,8 @@ class RobotVelocityRecorder(Node):
         self._experiments_root = resolve_experiments_root(
             self._experiments_dir, self._team_config_path
         )
+        self._requested_rollout_id = max(int(self.get_parameter("rollout_id").value), 0)
+        self._overwrite_existing = _as_bool(self.get_parameter("overwrite_existing").value)
         self._rollout_control_topic = str(self.get_parameter("rollout_control_topic").value).strip()
         self._execution_status_topic = str(
             self.get_parameter("execution_status_topic").value
@@ -209,7 +220,9 @@ class RobotVelocityRecorder(Node):
                 f"Waiting for rollout-control messages on {self._rollout_control_topic}."
             )
         else:
-            default_rollout_id = int(self._team_config["first_rollout"]["id"])
+            default_rollout_id = self._requested_rollout_id or int(
+                self._team_config["first_rollout"]["id"]
+            )
             self._activate_rollout(default_rollout_id, use_legacy_directory=True)
 
         self._execution_status_sub = None
@@ -259,11 +272,10 @@ class RobotVelocityRecorder(Node):
                     team_config_path=self._team_config_path,
                     rollout_id=rollout_id,
                 )
-                if run_dir.exists():
-                    raise RuntimeError(
-                        f"Refusing to overwrite existing rollout directory {run_dir}. "
-                        "Use a fresh rollout id or archive the existing directory."
-                    )
+                self._prepare_run_dir_for_write(
+                    run_dir,
+                    refusal_hint="Use a fresh rollout id or archive the existing directory.",
+                )
             else:
                 run_config_dir = rollout_output_base_dir(
                     self._experiments_dir,
@@ -278,11 +290,10 @@ class RobotVelocityRecorder(Node):
                 team_config_path=self._team_config_path,
                 rollout_id=rollout_id,
             )
-            if run_dir.exists():
-                raise RuntimeError(
-                    f"Refusing to overwrite existing rollout directory {run_dir}. "
-                    "Use skip_existed_rollout on the rollout manager to skip it."
-                )
+            self._prepare_run_dir_for_write(
+                run_dir,
+                refusal_hint="Use skip_existed_rollout on the rollout manager to skip it.",
+            )
 
         run_dir.mkdir(parents=True, exist_ok=False)
 
@@ -321,6 +332,16 @@ class RobotVelocityRecorder(Node):
         )
         if not self._execution_status_topic:
             self._start_recording_all("no execution_status_topic configured")
+
+    def _prepare_run_dir_for_write(self, run_dir: Path, *, refusal_hint: str) -> None:
+        if not run_dir.exists():
+            return
+        if not self._overwrite_existing:
+            raise RuntimeError(
+                f"Refusing to overwrite existing rollout directory {run_dir}. {refusal_hint}"
+            )
+        shutil.rmtree(run_dir)
+        self.get_logger().warn(f"Removed existing rollout directory before recording: {run_dir}")
 
     def _close_active_rollout(self) -> None:
         if self._run_dir is None:

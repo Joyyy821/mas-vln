@@ -19,6 +19,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rosgraph_msgs.msg import Clock
 from tf2_msgs.msg import TFMessage
 
 
@@ -34,6 +35,15 @@ def _sim_time_to_stamp(sim_time_sec: float):
     stamp.sec = sec
     stamp.nanosec = nanosec
     return stamp
+
+
+def _copy_stamp(stamp):
+    from builtin_interfaces.msg import Time
+
+    copied = Time()
+    copied.sec = int(stamp.sec)
+    copied.nanosec = int(stamp.nanosec)
+    return copied
 
 
 class IsaacSystemRosRobotBridgeHelper(Node):
@@ -53,10 +63,19 @@ class IsaacSystemRosRobotBridgeHelper(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=100,
         )
+        clock_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
 
         self._cmd_subs = []
         self._odom_pubs: dict[str, object] = {}
         self._tf_pubs: dict[str, object] = {}
+        self._latest_clock_stamp = None
+        self._waiting_for_clock_logged = False
+        self._clock_sub = self.create_subscription(Clock, "/clock", self._clock_callback, clock_qos)
         for namespace in robot_namespaces:
             clean_namespace = namespace.strip("/")
             self._cmd_subs.append(
@@ -86,6 +105,9 @@ class IsaacSystemRosRobotBridgeHelper(Node):
             f"Connected to Isaac Sim robot bridge at {host}:{port}. "
             f"Namespaces: {robot_namespaces}"
         )
+
+    def _clock_callback(self, msg: Clock) -> None:
+        self._latest_clock_stamp = _copy_stamp(msg.clock)
 
     def _cmd_vel_callback(self, namespace: str, msg: Twist) -> None:
         message = {
@@ -128,7 +150,14 @@ class IsaacSystemRosRobotBridgeHelper(Node):
             return
 
         sim_time_sec = float(message.get("sim_time_sec", 0.0))
-        stamp = _sim_time_to_stamp(sim_time_sec)
+        if self._latest_clock_stamp is None:
+            if not self._waiting_for_clock_logged:
+                self.get_logger().warn(
+                    "Waiting for /clock before publishing Isaac odom/tf state."
+                )
+                self._waiting_for_clock_logged = True
+            return
+        stamp = _copy_stamp(self._latest_clock_stamp)
         position = [float(value) for value in message.get("position", [0.0, 0.0, 0.0])[:3]]
         orientation = [
             float(value)

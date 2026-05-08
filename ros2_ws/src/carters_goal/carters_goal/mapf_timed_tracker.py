@@ -123,11 +123,13 @@ class MapfTimedTracker(Node):
         self.declare_parameter("global_plan_topic", "global_plan")
         self.declare_parameter("control_frequency", 20.0)
         self.declare_parameter("mapf_step_duration", 0.5)
-        self.declare_parameter("max_translation_duration", 0.0)
+        self.declare_parameter("max_translation_duration_ratio", 1.5)
         self.declare_parameter("goal_position_tolerance", 0.08)
+        self.declare_parameter("track_success_position_tolerance", 1.0)
         self.declare_parameter("goal_yaw_tolerance", 0.08)
         self.declare_parameter("pre_rotate_yaw_tolerance", 0.12)
         self.declare_parameter("slow_down_radius", 1.0)
+        self.declare_parameter("allow_reverse_final_approach", False)
         self.declare_parameter("tracking_longitudinal_kp", 1.6)
         self.declare_parameter("tracking_lateral_kp", 2.25)
         self.declare_parameter("tracking_yaw_kp", 1.5)
@@ -147,24 +149,38 @@ class MapfTimedTracker(Node):
         self.declare_parameter("rollout_control_topic", "")
         self.declare_parameter("team_config_file", "")
         self.declare_parameter("experiments_dir", "")
+        self.declare_parameter("rollout_id", 0)
+        self.declare_parameter("stall_check_period_sec", 1.0)
+        self.declare_parameter("stall_timeout_sec", 8.0)
+        self.declare_parameter("stall_cmd_linear_threshold", 0.02)
+        self.declare_parameter("stall_cmd_angular_threshold", 0.10)
+        self.declare_parameter("stall_motion_linear_threshold", 0.01)
+        self.declare_parameter("stall_motion_angular_threshold", 0.03)
 
         self._agent_num = int(self.get_parameter("agent_num").value)
         self._global_frame_id = str(self.get_parameter("global_frame_id").value)
         self._global_plan_topic = str(self.get_parameter("global_plan_topic").value)
         self._control_frequency = float(self.get_parameter("control_frequency").value)
         self._mapf_step_duration = float(self.get_parameter("mapf_step_duration").value)
-        self._configured_max_translation_duration = max(
-            float(self.get_parameter("max_translation_duration").value),
-            0.0,
+        self._max_translation_duration_ratio = max(
+            float(self.get_parameter("max_translation_duration_ratio").value),
+            1.0,
         )
         self._goal_position_tolerance = float(
             self.get_parameter("goal_position_tolerance").value
+        )
+        self._track_success_position_tolerance = max(
+            float(self.get_parameter("track_success_position_tolerance").value),
+            self._goal_position_tolerance,
         )
         self._goal_yaw_tolerance = float(self.get_parameter("goal_yaw_tolerance").value)
         self._pre_rotate_yaw_tolerance = float(
             self.get_parameter("pre_rotate_yaw_tolerance").value
         )
         self._slow_down_radius = float(self.get_parameter("slow_down_radius").value)
+        self._allow_reverse_final_approach = bool(
+            self.get_parameter("allow_reverse_final_approach").value
+        )
         self._tracking_longitudinal_kp = float(
             self.get_parameter("tracking_longitudinal_kp").value
         )
@@ -200,7 +216,40 @@ class MapfTimedTracker(Node):
         team_config_file = str(self.get_parameter("team_config_file").value).strip()
         self._team_config_path = Path(team_config_file).expanduser().resolve() if team_config_file else None
         self._experiments_dir = str(self.get_parameter("experiments_dir").value).strip()
-        self._active_rollout_id: int | None = None
+        requested_rollout_id = max(int(self.get_parameter("rollout_id").value), 0)
+        self._active_rollout_id: int | None = requested_rollout_id or None
+        self._stall_check_period_sec = max(
+            float(self.get_parameter("stall_check_period_sec").value),
+            0.1,
+        )
+        self._stall_timeout_sec = max(
+            float(self.get_parameter("stall_timeout_sec").value),
+            self._stall_check_period_sec,
+        )
+        self._stall_cmd_linear_threshold = max(
+            float(self.get_parameter("stall_cmd_linear_threshold").value),
+            0.0,
+        )
+        self._stall_cmd_angular_threshold = max(
+            float(self.get_parameter("stall_cmd_angular_threshold").value),
+            0.0,
+        )
+        self._stall_motion_linear_threshold = max(
+            float(self.get_parameter("stall_motion_linear_threshold").value),
+            0.0,
+        )
+        self._stall_motion_angular_threshold = max(
+            float(self.get_parameter("stall_motion_angular_threshold").value),
+            0.0,
+        )
+        if self._active_rollout_id is not None and self._team_config_path is not None:
+            self._tracking_log_dir = str(
+                rollout_run_dir(
+                    self._experiments_dir,
+                    team_config_path=self._team_config_path,
+                    rollout_id=self._active_rollout_id,
+                )
+            )
 
         self._agent_names: List[str] = []
         self._base_frame_ids: List[str] = []
@@ -213,6 +262,7 @@ class MapfTimedTracker(Node):
         self._agent_tracking_lateral_kps: List[float] = []
         self._agent_tracking_yaw_kps: List[float] = []
         self._agent_integral_limits: List[float] = []
+        self._agent_allow_reverse_final_approach: List[bool] = []
         self._cmd_vel_publishers = []
         for idx in range(self._agent_num):
             agent_param = f"agent_name.agent_{idx}"
@@ -226,6 +276,7 @@ class MapfTimedTracker(Node):
             tracking_lateral_kp_param = f"agent_tracking_lateral_kp.agent_{idx}"
             tracking_yaw_kp_param = f"agent_tracking_yaw_kp.agent_{idx}"
             integral_limit_param = f"agent_integral_limit.agent_{idx}"
+            reverse_final_approach_param = f"agent_allow_reverse_final_approach.agent_{idx}"
             self.declare_parameter(agent_param, f"robot{idx + 1}")
             self.declare_parameter(base_frame_param, f"robot{idx + 1}/base_link")
             self.declare_parameter(cmd_vel_param, f"/robot{idx + 1}/cmd_vel")
@@ -237,6 +288,10 @@ class MapfTimedTracker(Node):
             self.declare_parameter(tracking_lateral_kp_param, self._tracking_lateral_kp)
             self.declare_parameter(tracking_yaw_kp_param, self._tracking_yaw_kp)
             self.declare_parameter(integral_limit_param, self._integral_limit)
+            self.declare_parameter(
+                reverse_final_approach_param,
+                self._allow_reverse_final_approach,
+            )
 
             agent_name = str(self.get_parameter(agent_param).value)
             base_frame_id = str(self.get_parameter(base_frame_param).value)
@@ -268,6 +323,9 @@ class MapfTimedTracker(Node):
             self._agent_integral_limits.append(
                 max(float(self.get_parameter(integral_limit_param).value), 0.0)
             )
+            self._agent_allow_reverse_final_approach.append(
+                bool(self.get_parameter(reverse_final_approach_param).value)
+            )
             self._cmd_vel_publishers.append(self.create_publisher(Twist, cmd_vel_topic, 1))
 
         self._tf_buffer = Buffer()
@@ -293,6 +351,9 @@ class MapfTimedTracker(Node):
         self._integral_y = [0.0 for _ in range(self._agent_num)]
         self._integral_yaw = [0.0 for _ in range(self._agent_num)]
         self._agent_done_status_published = [False for _ in range(self._agent_num)]
+        self._stall_last_check_time = [None for _ in range(self._agent_num)]
+        self._stall_last_pose = [None for _ in range(self._agent_num)]
+        self._stall_accumulated_sec = [0.0 for _ in range(self._agent_num)]
         self._last_control_time: Time | None = None
         self._execution_index = 0
 
@@ -329,7 +390,8 @@ class MapfTimedTracker(Node):
                 f"rotation_yaw_kp={self._agent_rotation_yaw_kps[agent_idx]:.3f}, "
                 f"tracking_kp=({self._agent_tracking_longitudinal_kps[agent_idx]:.3f}, "
                 f"{self._agent_tracking_lateral_kps[agent_idx]:.3f}, "
-                f"{self._agent_tracking_yaw_kps[agent_idx]:.3f})."
+                f"{self._agent_tracking_yaw_kps[agent_idx]:.3f}), "
+                f"reverse_final_approach={self._agent_allow_reverse_final_approach[agent_idx]}."
             )
 
     def _plan_callback(self, plan_msg: GlobalPlan) -> None:
@@ -374,6 +436,7 @@ class MapfTimedTracker(Node):
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
         self._rotation_states = [None for _ in range(self._agent_num)]
         self._agent_done_status_published = [False for _ in range(self._agent_num)]
+        self._reset_all_stall_detectors()
         self._reset_all_integrators()
         self._publish_execution_status("active")
 
@@ -399,15 +462,14 @@ class MapfTimedTracker(Node):
                 )
 
         planned_max_translation_duration = max(durations, default=0.0)
-        self._max_translation_duration = max(
-            planned_max_translation_duration,
-            self._configured_max_translation_duration,
+        self._max_translation_duration = (
+            planned_max_translation_duration * self._max_translation_duration_ratio
         )
         duration_text = ", ".join(f"{duration:.2f}s" for duration in durations)
         self.get_logger().info(
             f"Loaded timed MAPF plan with per-agent translation durations [{duration_text}]. "
-            f"Configured max translation duration is {self._configured_max_translation_duration:.2f}s; "
-            f"using global translation horizon {self._max_translation_duration:.2f}s. "
+            f"Using translation timeout ratio {self._max_translation_duration_ratio:.2f}, "
+            f"so global translation timeout is {self._max_translation_duration:.2f}s. "
             "Waiting for all agents to finish pre-rotation before starting the shared clock."
         )
         self._log_reference_separation()
@@ -442,11 +504,15 @@ class MapfTimedTracker(Node):
                     self._pre_rotate_yaw_tolerance,
                     phase_label="pre_rotate",
                 ):
+                    if not self._active:
+                        return
                     self._pre_rotate_complete[agent_idx] = True
                     self._publish_zero(agent_idx)
                     self.get_logger().info(
                         f"Agent {agent_idx} finished pre-rotation and is waiting at the shared start barrier."
                     )
+                elif not self._active:
+                    return
 
             if all(self._pre_rotate_complete):
                 self._start_translation_phase(now)
@@ -454,6 +520,12 @@ class MapfTimedTracker(Node):
 
         assert self._trajectory_start_time is not None
         elapsed = max((now - self._trajectory_start_time).nanoseconds / 1e9, 0.0)
+        if (
+            self._max_translation_duration > 0.0
+            and elapsed > self._max_translation_duration
+            and self._handle_translation_timeout(elapsed)
+        ):
+            return
 
         for agent_idx, trajectory in enumerate(self._trajectories):
             if trajectory is None or self._completed[agent_idx]:
@@ -469,8 +541,12 @@ class MapfTimedTracker(Node):
                     dt,
                     phase_label="track",
                 ):
+                    if not self._active:
+                        return
                     self._finish_agent_translation(agent_idx, trajectory)
                     continue
+                if not self._active:
+                    return
 
                 if elapsed >= trajectory.translation_duration:
                     self._phases[agent_idx] = "final_approach"
@@ -489,7 +565,11 @@ class MapfTimedTracker(Node):
                     dt,
                     phase_label="final_approach",
                 ):
+                    if not self._active:
+                        return
                     self._finish_agent_translation(agent_idx, trajectory)
+                elif not self._active:
+                    return
                 continue
 
             if phase == "post_rotate":
@@ -499,6 +579,8 @@ class MapfTimedTracker(Node):
                     self._goal_yaw_tolerance,
                     phase_label="post_rotate",
                 ):
+                    if not self._active:
+                        return
                     self._publish_zero(agent_idx)
                     self._completed[agent_idx] = True
                     self._phases[agent_idx] = "done"
@@ -507,11 +589,15 @@ class MapfTimedTracker(Node):
                     )
                     self._log_tracking_error_summary(agent_idx, trajectory)
                     self._publish_agent_done_status(agent_idx)
+                elif not self._active:
+                    return
                 continue
 
             self._publish_zero(agent_idx)
 
         if all(self._completed):
+            if not self._validate_track_success():
+                return
             self.get_logger().info("Finished executing MAPF plan with timed trajectory tracking.")
             self._active = False
             self._translation_started = False
@@ -520,7 +606,71 @@ class MapfTimedTracker(Node):
             self._publish_execution_status("succeeded")
             self._start_pending_plan()
 
-    def _finish_agent_translation(self, agent_idx: int, trajectory: AgentTrajectory) -> None:
+    def _handle_translation_timeout(self, elapsed: float) -> bool:
+        failures: list[str] = []
+        transitioned_agents: list[int] = []
+
+        for agent_idx, trajectory in enumerate(self._trajectories):
+            if trajectory is None or self._completed[agent_idx]:
+                continue
+
+            phase = self._phases[agent_idx]
+            if phase not in {"track", "final_approach"}:
+                continue
+
+            final_sample = trajectory.final_sample
+            pose = self._lookup_robot_pose(agent_idx)
+            if pose is None or final_sample is None:
+                failures.append(f"agent {agent_idx} ({self._agent_names[agent_idx]}): missing pose")
+                continue
+
+            final_distance = self._distance(pose[0], pose[1], final_sample.x, final_sample.y)
+            if final_distance > self._track_success_position_tolerance:
+                failures.append(
+                    f"agent {agent_idx} ({self._agent_names[agent_idx]}): "
+                    f"final_distance={final_distance:.3f}m "
+                    f"> tolerance={self._track_success_position_tolerance:.3f}m"
+                )
+                continue
+
+            self._finish_agent_translation(
+                agent_idx,
+                trajectory,
+                reason=(
+                    "translation timeout reached while inside track success tolerance "
+                    f"({final_distance:.3f}m <= {self._track_success_position_tolerance:.3f}m)"
+                ),
+            )
+            transitioned_agents.append(agent_idx)
+
+        if failures:
+            self._fail_execution(
+                f"Timed tracker exceeded translation timeout: elapsed={elapsed:.2f}s, "
+                f"limit={self._max_translation_duration:.2f}s "
+                f"(ratio={self._max_translation_duration_ratio:.2f}); "
+                + "; ".join(failures)
+            )
+            return True
+
+        if transitioned_agents:
+            transitioned_text = ", ".join(str(agent_idx) for agent_idx in transitioned_agents)
+            self.get_logger().warn(
+                f"Translation timeout elapsed={elapsed:.2f}s, "
+                f"limit={self._max_translation_duration:.2f}s. "
+                f"Agents [{transitioned_text}] were inside track success tolerance and "
+                "were moved to post-rotation instead of failing the rollout."
+            )
+            return True
+
+        return False
+
+    def _finish_agent_translation(
+        self,
+        agent_idx: int,
+        trajectory: AgentTrajectory,
+        *,
+        reason: str | None = None,
+    ) -> None:
         self._reset_integrator(agent_idx)
         if trajectory.final_goal_yaw is None:
             self._completed[agent_idx] = True
@@ -532,9 +682,10 @@ class MapfTimedTracker(Node):
 
         self._phases[agent_idx] = "post_rotate"
         self._publish_zero(agent_idx)
-        self.get_logger().info(
-            f"Agent {agent_idx} reached final translation target and is starting post-rotation."
-        )
+        message = f"Agent {agent_idx} reached final translation target and is starting post-rotation."
+        if reason:
+            message = f"Agent {agent_idx} is starting post-rotation because {reason}."
+        self.get_logger().info(message)
 
     def _reset_execution_state(self, reason: str | None = None) -> None:
         had_execution_state = (
@@ -560,6 +711,7 @@ class MapfTimedTracker(Node):
         self._tracking_log_rows = [[] for _ in range(self._agent_num)]
         self._rotation_states = [None for _ in range(self._agent_num)]
         self._agent_done_status_published = [False for _ in range(self._agent_num)]
+        self._reset_all_stall_detectors()
         self._reset_all_integrators()
         self._publish_zero_to_all()
 
@@ -571,6 +723,7 @@ class MapfTimedTracker(Node):
         self._trajectory_start_time = now
         self._last_control_time = now
         self._reset_all_integrators()
+        self._reset_all_stall_detectors()
         for agent_idx, trajectory in enumerate(self._trajectories):
             if trajectory is None or self._completed[agent_idx]:
                 continue
@@ -658,14 +811,36 @@ class MapfTimedTracker(Node):
             return True
 
         ref = self._sample_trajectory(trajectory, elapsed)
+        allow_reverse_approach = (
+            self._agent_allow_reverse_final_approach[agent_idx]
+            and final_distance <= self._slow_down_radius
+        )
         if final_distance <= self._slow_down_radius:
-            ref = ReferenceState(
-                x=ref.x,
-                y=ref.y,
-                yaw=pose[2],
-                linear_velocity=0.0,
-                angular_velocity=0.0,
-            )
+            if allow_reverse_approach:
+                target_heading = math.atan2(final_sample.y - pose[1], final_sample.x - pose[0])
+                forward_yaw_error = self._normalize_angle(target_heading - pose[2])
+                reverse_heading = self._normalize_angle(target_heading + math.pi)
+                reverse_yaw_error = self._normalize_angle(reverse_heading - pose[2])
+                approach_yaw = (
+                    reverse_heading
+                    if abs(reverse_yaw_error) < abs(forward_yaw_error)
+                    else target_heading
+                )
+                ref = ReferenceState(
+                    x=final_sample.x,
+                    y=final_sample.y,
+                    yaw=approach_yaw,
+                    linear_velocity=0.0,
+                    angular_velocity=0.0,
+                )
+            else:
+                ref = ReferenceState(
+                    x=ref.x,
+                    y=ref.y,
+                    yaw=pose[2],
+                    linear_velocity=0.0,
+                    angular_velocity=0.0,
+                )
         dx = ref.x - pose[0]
         dy = ref.y - pose[1]
         position_error = math.hypot(dx, dy)
@@ -711,7 +886,7 @@ class MapfTimedTracker(Node):
 
         clamped_linear_cmd = self._clamp(
             linear_cmd,
-            0.0,
+            -self._agent_max_linear_speeds[agent_idx] if allow_reverse_approach else 0.0,
             self._agent_max_linear_speeds[agent_idx],
         )
         clamped_angular_cmd = self._clamp(
@@ -754,6 +929,18 @@ class MapfTimedTracker(Node):
         twist = Twist()
         twist.linear.x = clamped_linear_cmd
         twist.angular.z = clamped_angular_cmd
+        if self._update_stall_detector(
+            agent_idx=agent_idx,
+            pose=pose,
+            cmd_linear_x=clamped_linear_cmd,
+            cmd_angular_z=clamped_angular_cmd,
+        ):
+            self._fail_execution(
+                f"Detected stalled robot during {phase_label}: agent={agent_idx} "
+                f"({self._agent_names[agent_idx]}), cmd_linear={clamped_linear_cmd:.3f}, "
+                f"cmd_angular={clamped_angular_cmd:.3f}."
+            )
+            return False
         self._cmd_vel_publishers[agent_idx].publish(twist)
         return False
 
@@ -924,6 +1111,17 @@ class MapfTimedTracker(Node):
 
         twist = Twist()
         twist.angular.z = angular_cmd
+        if self._update_stall_detector(
+            agent_idx=agent_idx,
+            pose=pose,
+            cmd_linear_x=0.0,
+            cmd_angular_z=angular_cmd,
+        ):
+            self._fail_execution(
+                f"Detected stalled robot during {phase_label}: agent={agent_idx} "
+                f"({self._agent_names[agent_idx]}), cmd_angular={angular_cmd:.3f}."
+            )
+            return False
         self._cmd_vel_publishers[agent_idx].publish(twist)
         return False
 
@@ -995,6 +1193,95 @@ class MapfTimedTracker(Node):
     def _reset_all_integrators(self) -> None:
         for agent_idx in range(self._agent_num):
             self._reset_integrator(agent_idx)
+
+    def _reset_stall_detector(self, agent_idx: int) -> None:
+        self._stall_last_check_time[agent_idx] = None
+        self._stall_last_pose[agent_idx] = None
+        self._stall_accumulated_sec[agent_idx] = 0.0
+
+    def _reset_all_stall_detectors(self) -> None:
+        for agent_idx in range(self._agent_num):
+            self._reset_stall_detector(agent_idx)
+
+    def _update_stall_detector(
+        self,
+        *,
+        agent_idx: int,
+        pose: tuple[float, float, float],
+        cmd_linear_x: float,
+        cmd_angular_z: float,
+    ) -> bool:
+        command_is_nontrivial = (
+            abs(cmd_linear_x) >= self._stall_cmd_linear_threshold
+            or abs(cmd_angular_z) >= self._stall_cmd_angular_threshold
+        )
+        if not command_is_nontrivial:
+            self._reset_stall_detector(agent_idx)
+            return False
+
+        now = self.get_clock().now()
+        last_time = self._stall_last_check_time[agent_idx]
+        last_pose = self._stall_last_pose[agent_idx]
+        if last_time is None or last_pose is None:
+            self._stall_last_check_time[agent_idx] = now
+            self._stall_last_pose[agent_idx] = pose
+            self._stall_accumulated_sec[agent_idx] = 0.0
+            return False
+
+        dt = (now - last_time).nanoseconds / 1e9
+        if dt < self._stall_check_period_sec:
+            return False
+
+        translation_speed = self._distance(pose[0], pose[1], last_pose[0], last_pose[1]) / max(
+            dt,
+            1e-6,
+        )
+        angular_speed = abs(self._normalize_angle(pose[2] - last_pose[2])) / max(dt, 1e-6)
+        moving = (
+            translation_speed >= self._stall_motion_linear_threshold
+            or angular_speed >= self._stall_motion_angular_threshold
+        )
+        if moving:
+            self._stall_accumulated_sec[agent_idx] = 0.0
+        else:
+            self._stall_accumulated_sec[agent_idx] += dt
+
+        self._stall_last_check_time[agent_idx] = now
+        self._stall_last_pose[agent_idx] = pose
+        return self._stall_accumulated_sec[agent_idx] >= self._stall_timeout_sec
+
+    def _validate_track_success(self) -> bool:
+        failures: list[str] = []
+        for agent_idx, trajectory in enumerate(self._trajectories):
+            if trajectory is None:
+                continue
+            final_sample = trajectory.final_sample
+            pose = self._lookup_robot_pose(agent_idx)
+            if pose is None or final_sample is None:
+                failures.append(f"agent {agent_idx} ({self._agent_names[agent_idx]}): missing pose")
+                continue
+            final_distance = self._distance(pose[0], pose[1], final_sample.x, final_sample.y)
+            if final_distance > self._track_success_position_tolerance:
+                failures.append(
+                    f"agent {agent_idx} ({self._agent_names[agent_idx]}): "
+                    f"final_distance={final_distance:.3f}m "
+                    f"> tolerance={self._track_success_position_tolerance:.3f}m"
+                )
+
+        if not failures:
+            return True
+
+        self._fail_execution("Timed tracker final success check failed: " + "; ".join(failures))
+        return False
+
+    def _fail_execution(self, reason: str) -> None:
+        self.get_logger().error(reason)
+        for agent_idx, trajectory in enumerate(self._trajectories):
+            if trajectory is not None:
+                self._log_tracking_error_summary(agent_idx, trajectory)
+        self._publish_zero_to_all()
+        self._publish_execution_status("failed")
+        self._reset_execution_state()
 
     def _log_tracking_error_summary(
         self,
