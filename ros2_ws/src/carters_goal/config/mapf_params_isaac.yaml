@@ -61,7 +61,7 @@ mapf_base:
       rotation_yaw_kp: 0.55
       rotation_debug_period_sec: 2.0
       rotation_pi_hysteresis_rad: 0.35
-      mapf_step_duration: 1.0
+      mapf_step_duration: 1.2
       max_translation_duration: 0.0
       tracking_longitudinal_kp: 0.40
       tracking_lateral_kp: 0.30

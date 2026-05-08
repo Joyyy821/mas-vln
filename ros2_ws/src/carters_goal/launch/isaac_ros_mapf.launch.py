@@ -67,7 +67,7 @@ _TIMED_TRACKER_MODEL_PROFILES = {
         "agent_rotation_yaw_kp": 0.70,
         "agent_tracking_longitudinal_kp": 1.6,
         "agent_tracking_lateral_kp": 2.25,
-        "agent_tracking_yaw_kp": 1.5,
+        "agent_tracking_yaw_kp": 1.0,
         "agent_integral_limit": 0.0,
     },
     "carter_v1": {
@@ -76,7 +76,7 @@ _TIMED_TRACKER_MODEL_PROFILES = {
         "agent_rotation_max_angular_speed": 0.16,
         "agent_rotation_yaw_kp": 0.45,
         "agent_tracking_longitudinal_kp": 0.35,
-        "agent_tracking_lateral_kp": 0.25,
+        "agent_tracking_lateral_kp": 0.75,
         "agent_tracking_yaw_kp": 0.35,
         "agent_integral_limit": 0.0,
     },
@@ -85,7 +85,7 @@ _TIMED_TRACKER_MODEL_PROFILES = {
         "agent_max_angular_speed": 0.50,
         "agent_rotation_max_angular_speed": 0.30,
         "agent_rotation_yaw_kp": 2.50,
-        "agent_tracking_longitudinal_kp": 2.5,
+        "agent_tracking_longitudinal_kp": 1.0,
         "agent_tracking_lateral_kp": 2.0,
         "agent_tracking_yaw_kp": 1.2,
         "agent_integral_limit": 0.0,
@@ -96,7 +96,7 @@ _TIMED_TRACKER_MODEL_PROFILES = {
         "agent_rotation_max_angular_speed": 1.0,
         "agent_rotation_yaw_kp": 2.25,
         "agent_tracking_longitudinal_kp": 1.25,
-        "agent_tracking_lateral_kp": 3.0,
+        "agent_tracking_lateral_kp": 4.0,
         "agent_tracking_yaw_kp": 3.0,
         "agent_integral_limit": 0.0,
     },
@@ -334,6 +334,7 @@ def _launch_setup(context, *args, **kwargs):
                 "record_frequency_hz": record_frequency_hz,
                 "experiments_dir": experiments_dir,
                 "rollout_control_topic": rollout_control_topic,
+                "execution_status_topic": execution_status_topic,
             }
         ],
     )
