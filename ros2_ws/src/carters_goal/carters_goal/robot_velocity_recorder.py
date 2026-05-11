@@ -570,7 +570,7 @@ def main() -> None:
     try:
         node = RobotVelocityRecorder()
         rclpy.spin(node)
-    except ExternalShutdownException:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if node is not None:

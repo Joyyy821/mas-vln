@@ -10,6 +10,7 @@ from typing import Any
 import rclpy
 from geometry_msgs.msg import PoseArray, TransformStamped
 from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Int32
@@ -384,12 +385,17 @@ class InitialPoseTfPublisher(Node):
 
 def main() -> None:
     rclpy.init()
-    node = InitialPoseTfPublisher()
+    node: InitialPoseTfPublisher | None = None
     try:
+        node = InitialPoseTfPublisher()
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from mapf_msgs.msg import GlobalPlan
 from nav2_msgs.action import FollowPath
 from nav_msgs.msg import Path
 from rclpy.action import ActionClient
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.time import Time
 from std_msgs.msg import String
@@ -464,7 +465,12 @@ class MapfNav2Executor(Node):
         return 0.0
 
     def _publish_zero(self, agent_idx: int) -> None:
-        self._cmd_vel_publishers[agent_idx].publish(Twist())
+        if not rclpy.ok():
+            return
+        try:
+            self._cmd_vel_publishers[agent_idx].publish(Twist())
+        except Exception:
+            pass
 
     def _publish_zero_to_all(self) -> None:
         for agent_idx in range(self._agent_num):
@@ -541,12 +547,17 @@ class MapfNav2Executor(Node):
 
 def main() -> None:
     rclpy.init()
-    node = MapfNav2Executor()
+    node: MapfNav2Executor | None = None
     try:
+        node = MapfNav2Executor()
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

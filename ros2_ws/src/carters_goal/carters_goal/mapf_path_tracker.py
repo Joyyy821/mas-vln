@@ -11,6 +11,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion, Twist
 from mapf_msgs.msg import GlobalPlan
 from nav_msgs.msg import Path
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.time import Time
 from std_msgs.msg import String
@@ -304,7 +305,12 @@ class MapfPathTracker(Node):
         return compact_poses
 
     def _publish_zero(self, agent_idx: int) -> None:
-        self._cmd_vel_publishers[agent_idx].publish(Twist())
+        if not rclpy.ok():
+            return
+        try:
+            self._cmd_vel_publishers[agent_idx].publish(Twist())
+        except Exception:
+            pass
 
     def _publish_zero_to_all(self) -> None:
         for agent_idx in range(self._agent_num):
@@ -381,12 +387,17 @@ class MapfPathTracker(Node):
 
 def main() -> None:
     rclpy.init()
-    node = MapfPathTracker()
+    node: MapfPathTracker | None = None
     try:
+        node = MapfPathTracker()
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

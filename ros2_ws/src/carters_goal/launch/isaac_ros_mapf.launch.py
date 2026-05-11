@@ -9,7 +9,14 @@ import os
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, OpaqueFunction, TimerAction
+from launch.actions import (
+    DeclareLaunchArgument,
+    GroupAction,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+    Shutdown,
+    TimerAction,
+)
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -247,6 +254,7 @@ def _launch_setup(context, *args, **kwargs):
                 executable="map_server",
                 name="map_server",
                 output="screen",
+                on_exit=[Shutdown(reason="MAPF map_server exited")],
                 parameters=[
                     generated_mapf_params,
                     {
@@ -261,6 +269,7 @@ def _launch_setup(context, *args, **kwargs):
                 executable="mapf_base_node",
                 name="mapf_base_node",
                 output="screen",
+                on_exit=[Shutdown(reason="MAPF mapf_base_node exited")],
                 parameters=[
                     generated_costmap_params,
                     generated_mapf_params,
@@ -287,11 +296,14 @@ def _launch_setup(context, *args, **kwargs):
         executable="lifecycle_manager",
         name="lifecycle_manager_mapf",
         output="screen",
+        on_exit=[Shutdown(reason="MAPF lifecycle_manager exited")],
         parameters=[
             {
                 "use_sim_time": use_sim_time,
                 "autostart": autostart,
                 "node_names": lifecycle_nodes,
+                "bond_timeout": 0.0,
+                "attempt_respawn_reconnection": False,
             }
         ],
     )
@@ -391,6 +403,7 @@ def _launch_setup(context, *args, **kwargs):
                 name="plan_executor",
                 output="screen",
                 condition=IfCondition(run_plan_executor),
+                on_exit=[Shutdown(reason="MAPF plan executor exited")],
                 parameters=[
                     generated_mapf_params,
                     {
@@ -584,6 +597,8 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
+            SetEnvironmentVariable("RMW_FASTRTPS_USE_SHM", "0"),
             map_arg,
             team_config_arg,
             rollout_id_arg,

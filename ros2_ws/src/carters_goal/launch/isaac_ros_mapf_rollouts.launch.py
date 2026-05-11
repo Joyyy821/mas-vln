@@ -7,7 +7,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -32,6 +32,8 @@ def generate_launch_description():
                 "scene_ready_topic": LaunchConfiguration("scene_ready_topic"),
                 "scene_ready_timeout_sec": LaunchConfiguration("scene_ready_timeout_sec"),
                 "execution_timeout_sec": LaunchConfiguration("execution_timeout_sec"),
+                "execution_start_timeout_sec": LaunchConfiguration("execution_start_timeout_sec"),
+                "retry_cooldown_sec": LaunchConfiguration("retry_cooldown_sec"),
                 "status_topic": LaunchConfiguration("execution_status_topic"),
                 "mapf_params_file": LaunchConfiguration("mapf_params_file"),
                 "mapf_costmap_params_file": LaunchConfiguration("mapf_costmap_params_file"),
@@ -56,6 +58,8 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
+            SetEnvironmentVariable("RMW_FASTRTPS_USE_SHM", "0"),
             DeclareLaunchArgument(
                 "scene_root_dir",
                 default_value="",
@@ -103,6 +107,19 @@ def generate_launch_description():
                 "execution_timeout_sec",
                 default_value="900.0",
                 description="Hard wall-clock timeout for one child single-rollout launch attempt.",
+            ),
+            DeclareLaunchArgument(
+                "execution_start_timeout_sec",
+                default_value="300.0",
+                description=(
+                    "Hard wall-clock timeout for a child launch to publish any execution status. "
+                    "This catches lifecycle bringup failures before the full execution timeout."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "retry_cooldown_sec",
+                default_value="2.0",
+                description="Seconds to pause after terminating one child launch attempt.",
             ),
             DeclareLaunchArgument(
                 "mapf_params_file",

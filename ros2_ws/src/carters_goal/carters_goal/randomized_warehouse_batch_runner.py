@@ -196,6 +196,8 @@ class RandomizedWarehouseBatchRunner(Node):
         self.declare_parameter("scene_ready_topic", "/carters_goal/batch_scene_ready")
         self.declare_parameter("scene_ready_timeout_sec", 60.0)
         self.declare_parameter("execution_timeout_sec", 600.0)
+        self.declare_parameter("execution_start_timeout_sec", 300.0)
+        self.declare_parameter("retry_cooldown_sec", 2.0)
         self.declare_parameter("status_topic", "/mapf_base/plan_execution_status")
 
         self._scene_root_dir = str(self.get_parameter("scene_root_dir").value).strip()
@@ -212,6 +214,14 @@ class RandomizedWarehouseBatchRunner(Node):
         self._execution_timeout_sec = max(
             float(self.get_parameter("execution_timeout_sec").value),
             1.0,
+        )
+        self._execution_start_timeout_sec = max(
+            float(self.get_parameter("execution_start_timeout_sec").value),
+            1.0,
+        )
+        self._retry_cooldown_sec = max(
+            float(self.get_parameter("retry_cooldown_sec").value),
+            0.0,
         )
 
         self._launch_options = self._read_launch_options()
@@ -381,27 +391,44 @@ class RandomizedWarehouseBatchRunner(Node):
         )
         self._latest_execution_status = ""
         self.get_logger().info("Starting child launch: " + " ".join(command))
+        env = os.environ.copy()
+        env["FASTDDS_BUILTIN_TRANSPORTS"] = "UDPv4"
+        env["RMW_FASTRTPS_USE_SHM"] = "0"
         process = subprocess.Popen(
             command,
             preexec_fn=os.setsid,
+            env=env,
         )
         deadline = time.monotonic() + self._execution_timeout_sec
+        startup_deadline = time.monotonic() + self._execution_start_timeout_sec
+        execution_started = False
         result = "process_exited"
         try:
             while rclpy.ok():
                 rclpy.spin_once(self, timeout_sec=0.1)
-                if self._latest_execution_status in {"succeeded", "failed"}:
-                    result = self._latest_execution_status
+                status = self._latest_execution_status
+                if status:
+                    execution_started = True
+                if status in {"succeeded", "failed"}:
+                    result = status
                     break
                 return_code = process.poll()
                 if return_code is not None:
-                    result = f"process_exited:{return_code}"
+                    if execution_started:
+                        result = f"process_exited:{return_code}"
+                    else:
+                        result = f"startup_process_exited:{return_code}"
+                    break
+                if not execution_started and time.monotonic() >= startup_deadline:
+                    result = "startup_timeout"
                     break
                 if time.monotonic() >= deadline:
                     result = "timeout"
                     break
         finally:
             self._terminate_process_group(process)
+            if self._retry_cooldown_sec > 0.0:
+                time.sleep(self._retry_cooldown_sec)
         return result
 
     def _terminate_process_group(self, process: subprocess.Popen) -> None:
