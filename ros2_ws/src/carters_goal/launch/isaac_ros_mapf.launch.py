@@ -219,6 +219,7 @@ def _launch_setup(context, *args, **kwargs):
     record_velocity = LaunchConfiguration("record_velocity")
     record_frequency_hz = LaunchConfiguration("record_frequency_hz")
     record_odom_topic_suffix = LaunchConfiguration("record_odom_topic_suffix")
+    record_cmd_vel_topic_suffix = LaunchConfiguration("record_cmd_vel_topic_suffix")
     experiments_dir = LaunchConfiguration("experiments_dir")
     overwrite_existing_rollout = LaunchConfiguration("overwrite_existing_rollout")
     core_startup_delay = LaunchConfiguration("core_startup_delay")
@@ -347,6 +348,7 @@ def _launch_setup(context, *args, **kwargs):
                 "team_config_file": team_config_path,
                 "robot_namespaces": robot_namespaces,
                 "odom_topic_suffix": record_odom_topic_suffix,
+                "cmd_vel_topic_suffix": record_cmd_vel_topic_suffix,
                 "record_frequency_hz": record_frequency_hz,
                 "experiments_dir": experiments_dir,
                 "rollout_id": rollout_id or 0,
@@ -508,6 +510,11 @@ def generate_launch_description():
         default_value="chassis/odom",
         description="Robot-relative odometry topic suffix used as the simulator velocity source.",
     )
+    record_cmd_vel_topic_suffix_arg = DeclareLaunchArgument(
+        "record_cmd_vel_topic_suffix",
+        default_value="cmd_vel",
+        description="Robot-relative cmd_vel topic suffix recorded alongside simulator velocity samples.",
+    )
     experiments_dir_arg = DeclareLaunchArgument(
         "experiments_dir",
         default_value="",
@@ -611,6 +618,7 @@ def generate_launch_description():
             record_velocity_arg,
             record_frequency_arg,
             record_odom_topic_suffix_arg,
+            record_cmd_vel_topic_suffix_arg,
             experiments_dir_arg,
             overwrite_existing_rollout_arg,
             core_startup_delay_arg,

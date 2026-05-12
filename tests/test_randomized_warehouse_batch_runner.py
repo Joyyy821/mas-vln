@@ -125,7 +125,11 @@ class RandomizedWarehouseBatchRunnerTests(unittest.TestCase):
             command = batch_runner.build_single_rollout_launch_command(
                 scene=scene,
                 rollout_id=5,
-                launch_options={"execution_backend": "timed_tracker", "experiments_dir": ""},
+                launch_options={
+                    "execution_backend": "timed_tracker",
+                    "record_cmd_vel_topic_suffix": "cmd_vel",
+                    "experiments_dir": "",
+                },
             )
 
             self.assertIn(f"team_config_file:={scene_dir / 'team_config.yaml'}", command)
@@ -133,6 +137,35 @@ class RandomizedWarehouseBatchRunnerTests(unittest.TestCase):
             self.assertIn(f"map:={scene_dir / 'mapf_map.yaml'}", command)
             self.assertIn("overwrite_existing_rollout:=true", command)
             self.assertIn("execution_backend:=timed_tracker", command)
+            self.assertIn("record_cmd_vel_topic_suffix:=cmd_vel", command)
+
+    def test_success_cleanup_removes_tracker_diagnostics_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rollout_dir = Path(tmpdir) / "rollout"
+            rollout_dir.mkdir()
+            tracker_csv = rollout_dir / "mapf_timed_tracker_pid123_exec001_nova_carter.csv"
+            tracker_csv.write_text("elapsed\n", encoding="utf-8")
+            other_tracker_csv = rollout_dir / "mapf_timed_tracker_pid456_exec001_jackal.csv"
+            other_tracker_csv.write_text("elapsed\n", encoding="utf-8")
+            velocity_csv = rollout_dir / "nova_carter_velocity.csv"
+            velocity_csv.write_text("timestamp_ns,vx,vy,wz\n", encoding="utf-8")
+            run_config = rollout_dir / "run_config.yaml"
+            run_config.write_text("run_id: 1\n", encoding="utf-8")
+            plots_dir = rollout_dir / "tracking_plots"
+            plots_dir.mkdir()
+            (plots_dir / "summary.png").write_text("plot\n", encoding="utf-8")
+
+            removed_files, removed_directories = batch_runner.cleanup_successful_rollout_artifacts(
+                rollout_dir
+            )
+
+            self.assertEqual(removed_files, 2)
+            self.assertEqual(removed_directories, 1)
+            self.assertFalse(tracker_csv.exists())
+            self.assertFalse(other_tracker_csv.exists())
+            self.assertFalse(plots_dir.exists())
+            self.assertTrue(velocity_csv.is_file())
+            self.assertTrue(run_config.is_file())
 
 
 if __name__ == "__main__":

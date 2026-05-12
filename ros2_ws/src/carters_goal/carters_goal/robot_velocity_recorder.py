@@ -13,7 +13,7 @@ from typing import Any
 
 import rclpy
 import yaml
-from geometry_msgs.msg import PoseArray
+from geometry_msgs.msg import PoseArray, Twist
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -118,6 +118,7 @@ class RobotVelocityRecorder(Node):
         self.declare_parameter("team_config_file", "")
         self.declare_parameter("robot_namespaces", [""])
         self.declare_parameter("odom_topic_suffix", "chassis/odom")
+        self.declare_parameter("cmd_vel_topic_suffix", "cmd_vel")
         self.declare_parameter("record_frequency_hz", 20.0)
         self.declare_parameter("experiments_dir", "")
         self.declare_parameter("rollout_id", 0)
@@ -150,6 +151,7 @@ class RobotVelocityRecorder(Node):
             )
 
         self._odom_topic_suffix = str(self.get_parameter("odom_topic_suffix").value).strip()
+        self._cmd_vel_topic_suffix = str(self.get_parameter("cmd_vel_topic_suffix").value).strip()
         self._record_frequency_hz = max(float(self.get_parameter("record_frequency_hz").value), 0.0)
         self._min_period_ns = (
             int(1_000_000_000.0 / self._record_frequency_hz)
@@ -180,6 +182,7 @@ class RobotVelocityRecorder(Node):
 
         self._sample_counts = {name: 0 for name in self._robot_namespaces}
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
+        self._stale_odom_stamp_skip_counts = {name: 0 for name in self._robot_namespaces}
         self._last_tf_warn_ns = {name: 0 for name in self._robot_namespaces}
         self._recording_enabled_by_robot = {name: False for name in self._robot_namespaces}
         self._recording_started_at_ns: int | None = None
@@ -190,6 +193,10 @@ class RobotVelocityRecorder(Node):
         self._csv_writers: dict[str, csv.writer] = {}
         self._file_paths: dict[str, Path] = {}
         self._odom_subscriptions = []
+        self._cmd_vel_subscriptions = []
+        self._latest_cmd_vel_by_robot: dict[str, tuple[int | None, float, float, float]] = {
+            name: (None, 0.0, 0.0, 0.0) for name in self._robot_namespaces
+        }
         self._base_frame_ids = {
             name: _join_frame(name, self._base_frame_suffix) for name in self._robot_namespaces
         }
@@ -198,12 +205,21 @@ class RobotVelocityRecorder(Node):
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
         for namespace in self._robot_namespaces:
-            topic_name = _join_topic(namespace, self._odom_topic_suffix)
+            odom_topic_name = _join_topic(namespace, self._odom_topic_suffix)
             self._odom_subscriptions.append(
                 self.create_subscription(
                     Odometry,
-                    topic_name,
+                    odom_topic_name,
                     lambda msg, robot_name=namespace: self._odom_callback(robot_name, msg),
+                    50,
+                )
+            )
+            cmd_vel_topic_name = _join_topic(namespace, self._cmd_vel_topic_suffix)
+            self._cmd_vel_subscriptions.append(
+                self.create_subscription(
+                    Twist,
+                    cmd_vel_topic_name,
+                    lambda msg, robot_name=namespace: self._cmd_vel_callback(robot_name, msg),
                     50,
                 )
             )
@@ -305,6 +321,7 @@ class RobotVelocityRecorder(Node):
         self._created_at = dt.datetime.now().astimezone().isoformat()
         self._sample_counts = {name: 0 for name in self._robot_namespaces}
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
+        self._stale_odom_stamp_skip_counts = {name: 0 for name in self._robot_namespaces}
         self._last_tf_warn_ns = {name: 0 for name in self._robot_namespaces}
         self._recording_enabled_by_robot = {name: False for name in self._robot_namespaces}
         self._recording_started_at_ns = None
@@ -314,12 +331,29 @@ class RobotVelocityRecorder(Node):
         self._file_handles = {}
         self._csv_writers = {}
         self._file_paths = {}
+        self._latest_cmd_vel_by_robot = {
+            name: (None, 0.0, 0.0, 0.0) for name in self._robot_namespaces
+        }
 
         for namespace in self._robot_namespaces:
             file_path = run_dir / f"{namespace}_velocity.csv"
             file_handle = file_path.open("w", encoding="utf-8", newline="")
             writer = csv.writer(file_handle)
-            writer.writerow(["timestamp_ns", "vx", "vy", "wz", "x", "y", "yaw"])
+            writer.writerow(
+                [
+                    "timestamp_ns",
+                    "vx",
+                    "vy",
+                    "wz",
+                    "x",
+                    "y",
+                    "yaw",
+                    "cmd_vel_timestamp_ns",
+                    "cmd_vx",
+                    "cmd_vy",
+                    "cmd_wz",
+                ]
+            )
             file_handle.flush()
             self._file_handles[namespace] = file_handle
             self._csv_writers[namespace] = writer
@@ -362,6 +396,9 @@ class RobotVelocityRecorder(Node):
         self._file_handles = {}
         self._csv_writers = {}
         self._file_paths = {}
+        self._latest_cmd_vel_by_robot = {
+            name: (None, 0.0, 0.0, 0.0) for name in self._robot_namespaces
+        }
 
     def _execution_status_callback(self, msg: String) -> None:
         status = str(msg.data).strip()
@@ -393,6 +430,7 @@ class RobotVelocityRecorder(Node):
             name: True for name in self._robot_namespaces
         }
         self._last_recorded_stamp_ns = {name: None for name in self._robot_namespaces}
+        self._stale_odom_stamp_skip_counts = {name: 0 for name in self._robot_namespaces}
         self._write_metadata()
         self.get_logger().info(
             f"Started velocity recording for rollout {self._active_rollout_id} "
@@ -446,19 +484,20 @@ class RobotVelocityRecorder(Node):
             stamp_ns = self.get_clock().now().nanoseconds
 
         last_recorded_stamp_ns = self._last_recorded_stamp_ns[robot_name]
-        if last_recorded_stamp_ns is not None and stamp_ns <= last_recorded_stamp_ns:
-            last_recorded_stamp_ns = None
-            self._last_recorded_stamp_ns[robot_name] = None
-        if (
-            self._min_period_ns > 0
-            and last_recorded_stamp_ns is not None
-            and stamp_ns - last_recorded_stamp_ns < self._min_period_ns
-        ):
-            return
+        if last_recorded_stamp_ns is not None:
+            if stamp_ns <= last_recorded_stamp_ns:
+                self._stale_odom_stamp_skip_counts[robot_name] += 1
+                return
+            if self._min_period_ns > 0 and stamp_ns - last_recorded_stamp_ns < self._min_period_ns:
+                return
 
         pose = self._lookup_robot_pose(robot_name)
         if pose is None:
             return
+        cmd_timestamp_ns, cmd_vx, cmd_vy, cmd_wz = self._latest_cmd_vel_by_robot.get(
+            robot_name,
+            (None, 0.0, 0.0, 0.0),
+        )
 
         self._csv_writers[robot_name].writerow(
             [
@@ -469,11 +508,23 @@ class RobotVelocityRecorder(Node):
                 pose[0],
                 pose[1],
                 pose[2],
+                "" if cmd_timestamp_ns is None else cmd_timestamp_ns,
+                cmd_vx,
+                cmd_vy,
+                cmd_wz,
             ]
         )
         self._file_handles[robot_name].flush()
         self._last_recorded_stamp_ns[robot_name] = stamp_ns
         self._sample_counts[robot_name] += 1
+
+    def _cmd_vel_callback(self, robot_name: str, msg: Twist) -> None:
+        self._latest_cmd_vel_by_robot[robot_name] = (
+            self.get_clock().now().nanoseconds,
+            float(msg.linear.x),
+            float(msg.linear.y),
+            float(msg.angular.z),
+        )
 
     def _lookup_robot_pose(self, robot_name: str) -> tuple[float, float, float] | None:
         try:
@@ -518,6 +569,7 @@ class RobotVelocityRecorder(Node):
             "record_settings": {
                 "source": "simulator_tf_and_odometry",
                 "odom_topic_suffix": self._odom_topic_suffix,
+                "cmd_vel_topic_suffix": self._cmd_vel_topic_suffix,
                 "record_frequency_hz": self._record_frequency_hz,
                 "timestamp_field": "header.stamp",
                 "velocity_fields": {
@@ -530,10 +582,17 @@ class RobotVelocityRecorder(Node):
                     "y": f"tf[{self._global_frame_id} -> <robot>/{self._base_frame_suffix}].translation.y",
                     "yaw": f"quaternion_to_yaw(tf[{self._global_frame_id} -> <robot>/{self._base_frame_suffix}].rotation)",
                 },
+                "command_velocity_fields": {
+                    "cmd_vel_timestamp_ns": "RobotVelocityRecorder receipt timestamp for geometry_msgs/msg/Twist",
+                    "cmd_vx": "cmd_vel.linear.x",
+                    "cmd_vy": "cmd_vel.linear.y",
+                    "cmd_wz": "cmd_vel.angular.z",
+                },
                 "global_frame_id": self._global_frame_id,
                 "base_frame_suffix": self._base_frame_suffix,
                 "timestamp_units": "nanoseconds",
                 "message_type": "nav_msgs/msg/Odometry",
+                "command_message_type": "geometry_msgs/msg/Twist",
                 "start_trigger": "execution_status:active",
                 "per_robot_stop_trigger": "execution_status:agent_done:<robot_name>",
                 "recording_started_at_ns": self._recording_started_at_ns,
@@ -546,9 +605,11 @@ class RobotVelocityRecorder(Node):
                 {
                     "name": namespace,
                     "odom_topic": _join_topic(namespace, self._odom_topic_suffix),
+                    "cmd_vel_topic": _join_topic(namespace, self._cmd_vel_topic_suffix),
                     "base_frame_id": self._base_frame_ids[namespace],
                     "recording_file": self._file_paths[namespace].name,
                     "sample_count": self._sample_counts[namespace],
+                    "stale_odom_stamp_skip_count": self._stale_odom_stamp_skip_counts[namespace],
                     "recording_active": self._recording_enabled_by_robot.get(namespace, False),
                     "recording_started_at_ns": self._recording_started_at_ns,
                     "recording_finished_at_ns": self._robot_recording_finished_at_ns.get(namespace),

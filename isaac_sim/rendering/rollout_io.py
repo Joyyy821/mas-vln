@@ -31,6 +31,10 @@ class VelocitySample:
     x: float | None = None
     y: float | None = None
     yaw: float | None = None
+    cmd_vel_timestamp_ns: int | None = None
+    cmd_vx: float | None = None
+    cmd_vy: float | None = None
+    cmd_wz: float | None = None
 
     @property
     def has_pose(self) -> bool:
@@ -349,6 +353,17 @@ def _load_velocity_samples(csv_path: Path) -> list[VelocitySample]:
             raise ValueError(f"{csv_path} is missing required pose columns: {missing_pose_label}")
         has_pose_columns = present_pose_columns == pose_columns
 
+        command_columns = {"cmd_vel_timestamp_ns", "cmd_vx", "cmd_vy", "cmd_wz"}
+        present_command_columns = command_columns.intersection(reader.fieldnames)
+        if present_command_columns and present_command_columns != command_columns:
+            missing_command_label = ", ".join(
+                sorted(command_columns.difference(reader.fieldnames))
+            )
+            raise ValueError(
+                f"{csv_path} is missing required command velocity columns: {missing_command_label}"
+            )
+        has_command_columns = present_command_columns == command_columns
+
         samples = [
             VelocitySample(
                 timestamp_ns=int(row["timestamp_ns"]),
@@ -358,6 +373,14 @@ def _load_velocity_samples(csv_path: Path) -> list[VelocitySample]:
                 x=float(row["x"]) if has_pose_columns else None,
                 y=float(row["y"]) if has_pose_columns else None,
                 yaw=float(row["yaw"]) if has_pose_columns else None,
+                cmd_vel_timestamp_ns=(
+                    int(row["cmd_vel_timestamp_ns"])
+                    if has_command_columns and row["cmd_vel_timestamp_ns"]
+                    else None
+                ),
+                cmd_vx=float(row["cmd_vx"]) if has_command_columns else None,
+                cmd_vy=float(row["cmd_vy"]) if has_command_columns else None,
+                cmd_wz=float(row["cmd_wz"]) if has_command_columns else None,
             )
             for row in reader
         ]

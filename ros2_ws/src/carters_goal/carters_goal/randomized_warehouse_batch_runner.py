@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import time
@@ -181,6 +182,25 @@ def build_single_rollout_launch_command(
     return command
 
 
+def cleanup_successful_rollout_artifacts(rollout_dir: Path) -> tuple[int, int]:
+    removed_files = 0
+    for csv_path in sorted(rollout_dir.glob("mapf_timed_tracker_*.csv")):
+        if csv_path.is_file():
+            csv_path.unlink()
+            removed_files += 1
+
+    removed_directories = 0
+    tracking_plots_dir = rollout_dir / "tracking_plots"
+    if tracking_plots_dir.is_dir():
+        shutil.rmtree(tracking_plots_dir)
+        removed_directories += 1
+    elif tracking_plots_dir.exists():
+        tracking_plots_dir.unlink()
+        removed_files += 1
+
+    return removed_files, removed_directories
+
+
 class RandomizedWarehouseBatchRunner(Node):
     def __init__(self) -> None:
         if rclpy is None or String is None:
@@ -255,6 +275,7 @@ class RandomizedWarehouseBatchRunner(Node):
             "record_velocity",
             "record_frequency_hz",
             "record_odom_topic_suffix",
+            "record_cmd_vel_topic_suffix",
             "experiments_dir",
             "core_startup_delay",
             "lifecycle_manager_delay",
@@ -340,6 +361,7 @@ class RandomizedWarehouseBatchRunner(Node):
                 continue
             result = self._run_single_rollout_launch(item, attempt)
             if result == "succeeded":
+                self._cleanup_successful_rollout(rollout_dir)
                 return True
             self.get_logger().warn(
                 f"{item.scene.scene_id} rollout {item.rollout_id} attempt {attempt} "
@@ -468,6 +490,16 @@ class RandomizedWarehouseBatchRunner(Node):
         if result.returncode != 0:
             self.get_logger().warn(
                 f"Failed to plot timed-tracker logs for {rollout_dir}: exit {result.returncode}"
+            )
+
+    def _cleanup_successful_rollout(self, rollout_dir: Path) -> None:
+        if not rollout_dir.exists():
+            return
+        removed_files, removed_directories = cleanup_successful_rollout_artifacts(rollout_dir)
+        if removed_files or removed_directories:
+            self.get_logger().info(
+                f"Cleaned successful rollout diagnostics under {rollout_dir}: "
+                f"removed {removed_files} file(s) and {removed_directories} directory/directories."
             )
 
 

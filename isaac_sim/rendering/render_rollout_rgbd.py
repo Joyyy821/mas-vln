@@ -6,7 +6,9 @@ import argparse
 import csv
 import gc
 import importlib.util
+import json
 import math
+import shutil
 import statistics
 import sys
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ try:
         REPO_ROOT,
         RolloutData,
         RolloutRobotData,
+        load_rollout,
         load_rollouts,
         replay_elapsed_seconds,
         resolve_rollout_scene_usd_path,
@@ -37,6 +40,7 @@ except ImportError:
         REPO_ROOT,
         RolloutData,
         RolloutRobotData,
+        load_rollout,
         load_rollouts,
         replay_elapsed_seconds,
         resolve_rollout_scene_usd_path,
@@ -102,6 +106,25 @@ class LiveRobotMotionSpec:
     base_prim_path: str
 
 
+@dataclass(frozen=True)
+class BatchRenderTarget:
+    scene_id: str
+    scene_dir: Path
+    rollouts_dir: Path
+    rollout_id: int
+    rollout_dir: Path
+
+
+@dataclass(frozen=True)
+class BatchDiscovery:
+    root: Path
+    targets: tuple[BatchRenderTarget, ...]
+    skipped_scenes: tuple[dict[str, Any], ...]
+    skipped_failed_rollouts: tuple[dict[str, Any], ...]
+    skipped_missing_rollouts: tuple[dict[str, Any], ...]
+    skipped_existing_outputs: tuple[dict[str, Any], ...]
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -109,17 +132,35 @@ def _parse_args() -> argparse.Namespace:
             "camera images for every trajectory frame."
         )
     )
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "--experiments-root",
-        required=True,
         help="Directory containing rollout subdirectories with run_config.yaml files.",
+    )
+    input_group.add_argument(
+        "--randomized-warehouse-root",
+        help=(
+            "Directory containing randomized warehouse scene_<n> bundles. "
+            "Each scene bundle may contain a rollouts/ directory."
+        ),
     )
     parser.add_argument(
         "--rollout-ids",
         nargs="*",
         type=int,
         default=None,
-        help="Optional rollout ids to render. Defaults to every rollout under the experiments root.",
+        help=(
+            "Optional rollout ids to render. In randomized warehouse mode, the same id "
+            "filter is applied within every scene. Defaults to every discovered rollout."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Overwrite existing RGBD render outputs by deleting only rgb/, depth/, "
+            "render_manifest.csv, and legacy replay_pose_*.csv under each selected rollout."
+        ),
     )
     parser.add_argument(
         "--camera-config",
@@ -130,6 +171,227 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
+
+
+def _resolve_directory(path_value: str | Path, label: str) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"{label} does not exist: {path}")
+    if not path.is_dir():
+        raise NotADirectoryError(f"{label} is not a directory: {path}")
+    return path
+
+
+def _scene_number(scene_name: str) -> int | None:
+    if not scene_name.startswith("scene_"):
+        return None
+    try:
+        return int(scene_name.split("_", 1)[1])
+    except ValueError:
+        return None
+
+
+def _summary_entry(
+    scene_id: str,
+    *,
+    rollout_id: int | None = None,
+    path: Path | None = None,
+    reason: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"scene_id": scene_id}
+    if rollout_id is not None:
+        entry["rollout_id"] = int(rollout_id)
+    if path is not None:
+        entry["path"] = str(path)
+    if reason:
+        entry["reason"] = reason
+    if error:
+        entry["error"] = error
+    return entry
+
+
+def _load_scene_expected_rollout_ids(scene_dir: Path) -> tuple[int, ...]:
+    team_config_path = scene_dir / "team_config.yaml"
+    if not team_config_path.is_file():
+        return ()
+    with team_config_path.open("r", encoding="utf-8") as stream:
+        team_config = yaml.safe_load(stream) or {}
+    rollout_ids: list[int] = []
+    for rollout_config in list(team_config.get("rollouts", []) or []):
+        try:
+            rollout_ids.append(int(rollout_config.get("id")))
+        except (TypeError, ValueError):
+            continue
+    return tuple(sorted(set(rollout_ids)))
+
+
+def _failed_rollout_id(directory_name: str) -> int | None:
+    if not directory_name.endswith("_failed"):
+        return None
+    raw_id = directory_name[: -len("_failed")]
+    if not raw_id.isdigit():
+        return None
+    return int(raw_id)
+
+
+def _rollout_has_render_outputs(rollout_dir: Path) -> bool:
+    for output_name in ("rgb", "depth"):
+        output_root = rollout_dir / output_name
+        if output_root.exists() and any(path.is_file() for path in output_root.rglob("*")):
+            return True
+    return False
+
+
+def _remove_render_generated_artifacts(rollout_dir: Path) -> None:
+    for output_name in ("rgb", "depth"):
+        output_root = rollout_dir / output_name
+        if output_root.is_dir():
+            shutil.rmtree(output_root)
+        elif output_root.exists():
+            output_root.unlink()
+
+    for output_path in (rollout_dir / "render_manifest.csv",):
+        if output_path.is_file():
+            output_path.unlink()
+    for output_path in rollout_dir.glob("replay_pose_*.csv"):
+        if output_path.is_file():
+            output_path.unlink()
+
+
+def _discover_numeric_rollout_dirs(
+    rollouts_dir: Path,
+    requested_ids: set[int],
+) -> list[tuple[int, Path]]:
+    discovered: list[tuple[int, Path]] = []
+    for candidate in rollouts_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.isdigit():
+            continue
+        rollout_id = int(candidate.name)
+        if requested_ids and rollout_id not in requested_ids:
+            continue
+        if not (candidate / "run_config.yaml").is_file():
+            continue
+        discovered.append((rollout_id, candidate.resolve()))
+    discovered.sort(key=lambda item: item[0])
+    return discovered
+
+
+def _discover_randomized_warehouse_render_targets(
+    randomized_warehouse_root: str | Path,
+    *,
+    rollout_ids: list[int] | None = None,
+    overwrite: bool = False,
+) -> BatchDiscovery:
+    root = _resolve_directory(randomized_warehouse_root, "Randomized warehouse root")
+    requested_ids = set(rollout_ids or [])
+
+    scene_dirs: list[tuple[int, Path]] = []
+    for candidate in root.iterdir():
+        if not candidate.is_dir():
+            continue
+        scene_num = _scene_number(candidate.name)
+        if scene_num is None:
+            continue
+        scene_dirs.append((scene_num, candidate.resolve()))
+    scene_dirs.sort(key=lambda item: item[0])
+
+    targets: list[BatchRenderTarget] = []
+    skipped_scenes: list[dict[str, Any]] = []
+    skipped_failed_rollouts: list[dict[str, Any]] = []
+    skipped_missing_rollouts: list[dict[str, Any]] = []
+    skipped_existing_outputs: list[dict[str, Any]] = []
+
+    for _, scene_dir in scene_dirs:
+        scene_id = scene_dir.name
+        rollouts_dir = scene_dir / "rollouts"
+        if not rollouts_dir.is_dir():
+            skipped_scenes.append(
+                _summary_entry(
+                    scene_id,
+                    path=scene_dir,
+                    reason="missing rollouts directory",
+                )
+            )
+            continue
+
+        expected_ids = _load_scene_expected_rollout_ids(scene_dir)
+        if requested_ids:
+            expected_ids = tuple(rollout_id for rollout_id in expected_ids if rollout_id in requested_ids)
+
+        failed_ids: set[int] = set()
+        for candidate in sorted(rollouts_dir.iterdir(), key=lambda path: path.name):
+            if not candidate.is_dir():
+                continue
+            failed_id = _failed_rollout_id(candidate.name)
+            if failed_id is None:
+                continue
+            if requested_ids and failed_id not in requested_ids:
+                continue
+            failed_ids.add(failed_id)
+            skipped_failed_rollouts.append(
+                _summary_entry(
+                    scene_id,
+                    rollout_id=failed_id,
+                    path=candidate.resolve(),
+                    reason="failed rollout directory",
+                )
+            )
+
+        numeric_rollouts = _discover_numeric_rollout_dirs(rollouts_dir, requested_ids)
+        numeric_ids = {rollout_id for rollout_id, _ in numeric_rollouts}
+        for missing_id in sorted(set(expected_ids).difference(numeric_ids).difference(failed_ids)):
+            skipped_missing_rollouts.append(
+                _summary_entry(
+                    scene_id,
+                    rollout_id=missing_id,
+                    path=rollouts_dir / str(missing_id),
+                    reason="expected rollout directory is missing",
+                )
+            )
+
+        scene_target_count = 0
+        for rollout_id, rollout_dir in numeric_rollouts:
+            if _rollout_has_render_outputs(rollout_dir) and not overwrite:
+                skipped_existing_outputs.append(
+                    _summary_entry(
+                        scene_id,
+                        rollout_id=rollout_id,
+                        path=rollout_dir,
+                        reason="existing rendered RGB/depth outputs",
+                    )
+                )
+                continue
+            scene_target_count += 1
+            targets.append(
+                BatchRenderTarget(
+                    scene_id=scene_id,
+                    scene_dir=scene_dir,
+                    rollouts_dir=rollouts_dir.resolve(),
+                    rollout_id=rollout_id,
+                    rollout_dir=rollout_dir,
+                )
+            )
+
+        if scene_target_count == 0:
+            if numeric_rollouts:
+                reason = "all selected rollout directories were skipped"
+            elif requested_ids:
+                reason = "no selected numeric rollout directories with run_config.yaml"
+            else:
+                reason = "no numeric rollout directories with run_config.yaml"
+            skipped_scenes.append(_summary_entry(scene_id, path=scene_dir, reason=reason))
+
+    return BatchDiscovery(
+        root=root,
+        targets=tuple(targets),
+        skipped_scenes=tuple(skipped_scenes),
+        skipped_failed_rollouts=tuple(skipped_failed_rollouts),
+        skipped_missing_rollouts=tuple(skipped_missing_rollouts),
+        skipped_existing_outputs=tuple(skipped_existing_outputs),
+    )
 
 
 def _load_module(module_name: str, module_path: Path, extra_sys_path: Path | None = None) -> Any:
@@ -871,7 +1133,10 @@ def _build_live_camera_contexts(
     return contexts
 
 
-def _ensure_render_outputs_empty(rollout_dir: Path) -> tuple[Path, Path]:
+def _ensure_render_outputs_empty(rollout_dir: Path, *, overwrite: bool = False) -> tuple[Path, Path]:
+    if overwrite:
+        _remove_render_generated_artifacts(rollout_dir)
+
     rgb_root = rollout_dir / "rgb"
     depth_root = rollout_dir / "depth"
     for output_root in (rgb_root, depth_root):
@@ -946,6 +1211,29 @@ def _build_render_timestamps_ns(rollout: RolloutData) -> tuple[int, ...]:
     return tuple(clustered_timestamps_ns)
 
 
+def _render_frame_name(timestamp_ns: int) -> str:
+    return f"frame_{int(timestamp_ns)}.png"
+
+
+def _validate_unique_render_frame_names(
+    rollout: RolloutData,
+    render_timestamps_ns: tuple[int, ...],
+) -> None:
+    seen_frame_names: set[str] = set()
+    duplicates: list[str] = []
+    for timestamp_ns in render_timestamps_ns:
+        frame_name = _render_frame_name(timestamp_ns)
+        if frame_name in seen_frame_names:
+            duplicates.append(frame_name)
+        seen_frame_names.add(frame_name)
+    if duplicates:
+        duplicate_preview = ", ".join(duplicates[:5])
+        raise RuntimeError(
+            f"Rollout {rollout.rollout_id} produced duplicate render frame timestamp names: "
+            f"{duplicate_preview}"
+        )
+
+
 def _prepare_rollout_sampled_poses(
     rollout: RolloutData,
     render_timestamps_ns: tuple[int, ...],
@@ -955,16 +1243,7 @@ def _prepare_rollout_sampled_poses(
     for robot in rollout.robots:
         if _has_global_recorded_pose(rollout, robot):
             pose_trajectory = build_pose_trajectory(
-                [
-                    TimedPose(
-                        timestamp_ns=sample.timestamp_ns,
-                        x=float(sample.x),
-                        y=float(sample.y),
-                        z=robot.initial_pose.z,
-                        yaw=float(sample.yaw),
-                    )
-                    for sample in robot.velocity_samples
-                ],
+                _recorded_pose_samples_from_velocity(rollout, robot),
                 source_label=str(robot.velocity_path),
             )
             sampled_poses_by_robot[robot.name] = pose_trajectory.sample(render_timestamps_ns)
@@ -999,6 +1278,33 @@ def _prepare_rollout_sampled_poses(
         pose_source_by_robot[robot.name] = "velocity_integration_fallback"
 
     return sampled_poses_by_robot, pose_source_by_robot
+
+
+def _recorded_pose_samples_from_velocity(
+    rollout: RolloutData,
+    robot: RolloutRobotData,
+) -> list[TimedPose]:
+    deduped_by_timestamp: dict[int, TimedPose] = {}
+    duplicate_count = 0
+    for sample in robot.velocity_samples:
+        timed_pose = TimedPose(
+            timestamp_ns=sample.timestamp_ns,
+            x=float(sample.x),
+            y=float(sample.y),
+            z=robot.initial_pose.z,
+            yaw=float(sample.yaw),
+        )
+        if timed_pose.timestamp_ns in deduped_by_timestamp:
+            duplicate_count += 1
+        deduped_by_timestamp[timed_pose.timestamp_ns] = timed_pose
+    if duplicate_count:
+        print(
+            f"[INFO] Rollout {rollout.rollout_id} robot {robot.name}: "
+            f"deduplicated {duplicate_count} repeated recorded pose timestamps "
+            "before interpolation, keeping the last pose for each timestamp.",
+            flush=True,
+        )
+    return [deduped_by_timestamp[timestamp_ns] for timestamp_ns in sorted(deduped_by_timestamp)]
 
 
 def _median_positive_delta_ns(timestamps_ns: list[int]) -> int:
@@ -1043,51 +1349,6 @@ def _build_robot_render_active_masks(
         )
 
     return active_masks
-
-
-def _write_replay_pose_csvs(
-    rollout: RolloutData,
-    render_timestamps_ns: tuple[int, ...],
-    sampled_poses_by_robot: dict[str, list[TimedPose]],
-    pose_source_by_robot: dict[str, str],
-) -> None:
-    elapsed_seconds = replay_elapsed_seconds(render_timestamps_ns)
-    for robot in rollout.robots:
-        output_path = rollout.rollout_dir / f"replay_pose_{robot.name}.csv"
-        with output_path.open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(
-                [
-                    "timestamp_ns",
-                    "elapsed_s",
-                    "x",
-                    "y",
-                    "z",
-                    "yaw",
-                    "qx",
-                    "qy",
-                    "qz",
-                    "qw",
-                    "pose_source",
-                ]
-            )
-            for timed_pose, elapsed_s in zip(sampled_poses_by_robot[robot.name], elapsed_seconds):
-                qx, qy, qz, qw = _yaw_to_quaternion(timed_pose.yaw)
-                writer.writerow(
-                    [
-                        timed_pose.timestamp_ns,
-                        f"{elapsed_s:.9f}",
-                        f"{timed_pose.x:.9f}",
-                        f"{timed_pose.y:.9f}",
-                        f"{timed_pose.z:.9f}",
-                        f"{timed_pose.yaw:.9f}",
-                        f"{qx:.9f}",
-                        f"{qy:.9f}",
-                        f"{qz:.9f}",
-                        f"{qw:.9f}",
-                        pose_source_by_robot[robot.name],
-                    ]
-                )
 
 
 def _warm_up_cameras(sim_app: Any, live_contexts: list[LiveCameraContext]) -> None:
@@ -1236,20 +1497,24 @@ def _render_rollout(
     goal_sampler_module: Any,
     rollout: RolloutData,
     camera_settings: CameraSettings,
+    *,
+    overwrite: bool = False,
 ) -> None:
-    rgb_root, depth_root = _ensure_render_outputs_empty(rollout.rollout_dir)
+    rgb_root, depth_root = _ensure_render_outputs_empty(rollout.rollout_dir, overwrite=overwrite)
     render_timestamps_ns = _build_render_timestamps_ns(rollout)
+    _validate_unique_render_frame_names(rollout, render_timestamps_ns)
     sampled_poses_by_robot, pose_source_by_robot = _prepare_rollout_sampled_poses(
         rollout,
         render_timestamps_ns,
     )
     robot_camera_active_masks = _build_robot_render_active_masks(rollout, render_timestamps_ns)
-
-    _write_replay_pose_csvs(
-        rollout,
-        render_timestamps_ns,
-        sampled_poses_by_robot,
-        pose_source_by_robot,
+    pose_source_labels = ", ".join(
+        f"{robot_name}={pose_source}"
+        for robot_name, pose_source in sorted(pose_source_by_robot.items())
+    )
+    print(
+        f"[INFO] Rollout {rollout.rollout_id}: render replay pose sources: {pose_source_labels}",
+        flush=True,
     )
 
     scene_usd_path = resolve_rollout_scene_usd_path(rollout)
@@ -1353,7 +1618,7 @@ def _render_rollout(
                         )
 
                     rgb_output_dir, depth_output_dir = camera_output_dirs[context.output_name]
-                    frame_name = f"frame_{frame_index:06d}.png"
+                    frame_name = _render_frame_name(timestamp_ns)
                     rgb_path = rgb_output_dir / frame_name
                     depth_path = depth_output_dir / frame_name
                     _save_rgb_png(rgb_path, rgb_frame, camera_settings.output_resolution)
@@ -1394,15 +1659,95 @@ def _render_rollout(
         sim_app.update()
 
 
-def main() -> int:
-    args = _parse_args()
-    try:
-        rollouts = load_rollouts(args.experiments_root, rollout_ids=args.rollout_ids)
-        camera_settings = _load_camera_settings(args.camera_config)
-    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
-        print(f"RenderRolloutRGBD: {exc}", file=sys.stderr)
-        return 1
+def _rendered_scenes(rendered_rollouts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rollouts_by_scene: dict[str, list[int]] = {}
+    for entry in rendered_rollouts:
+        scene_id = str(entry["scene_id"])
+        rollouts_by_scene.setdefault(scene_id, []).append(int(entry["rollout_id"]))
+    return [
+        {"scene_id": scene_id, "rollout_ids": sorted(rollout_ids)}
+        for scene_id, rollout_ids in sorted(
+            rollouts_by_scene.items(),
+            key=lambda item: (_scene_number(item[0]) if _scene_number(item[0]) is not None else 10**9, item[0]),
+        )
+    ]
 
+
+def _build_batch_summary(
+    discovery: BatchDiscovery,
+    *,
+    camera_config_path: str | Path,
+    overwrite: bool,
+    rendered_rollouts: list[dict[str, Any]],
+    render_failed_rollouts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rendered_scene_ids = {entry["scene_id"] for entry in rendered_rollouts}
+    failed_scene_ids = {entry["scene_id"] for entry in render_failed_rollouts}
+    summary = {
+        "randomized_warehouse_root": str(discovery.root),
+        "camera_config": str(Path(camera_config_path).expanduser()),
+        "overwrite": bool(overwrite),
+        "rendered_scenes": _rendered_scenes(rendered_rollouts),
+        "rendered_rollouts": rendered_rollouts,
+        "skipped_scenes": list(discovery.skipped_scenes),
+        "skipped_failed_rollouts": list(discovery.skipped_failed_rollouts),
+        "skipped_missing_rollouts": list(discovery.skipped_missing_rollouts),
+        "skipped_existing_outputs": list(discovery.skipped_existing_outputs),
+        "render_failed_rollouts": render_failed_rollouts,
+        "counts": {
+            "target_rollouts": len(discovery.targets),
+            "rendered_scenes": len(rendered_scene_ids),
+            "render_failed_scenes": len(failed_scene_ids),
+            "rendered_rollouts": len(rendered_rollouts),
+            "skipped_scenes": len(discovery.skipped_scenes),
+            "skipped_failed_rollouts": len(discovery.skipped_failed_rollouts),
+            "skipped_missing_rollouts": len(discovery.skipped_missing_rollouts),
+            "skipped_existing_outputs": len(discovery.skipped_existing_outputs),
+            "render_failed_rollouts": len(render_failed_rollouts),
+        },
+    }
+    return summary
+
+
+def _write_batch_summary(summary: dict[str, Any], output_path: Path) -> None:
+    output_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _print_batch_summary(summary: dict[str, Any], output_path: Path) -> None:
+    counts = summary["counts"]
+    print("[INFO] Batch RGBD render summary:", flush=True)
+    print(
+        "[INFO]   rendered_rollouts={rendered_rollouts}, "
+        "render_failed_rollouts={render_failed_rollouts}, "
+        "skipped_existing_outputs={skipped_existing_outputs}, "
+        "skipped_failed_rollouts={skipped_failed_rollouts}, "
+        "skipped_missing_rollouts={skipped_missing_rollouts}, skipped_scenes={skipped_scenes}".format(
+            **counts
+        ),
+        flush=True,
+    )
+    if summary["rendered_scenes"]:
+        rendered_labels = [
+            f"{entry['scene_id']}:{','.join(str(rollout_id) for rollout_id in entry['rollout_ids'])}"
+            for entry in summary["rendered_scenes"]
+        ]
+        print(f"[INFO]   rendered scenes: {'; '.join(rendered_labels)}", flush=True)
+    if summary["skipped_scenes"]:
+        skipped_labels = [
+            f"{entry['scene_id']} ({entry.get('reason', 'skipped')})"
+            for entry in summary["skipped_scenes"]
+        ]
+        print(f"[INFO]   skipped scenes: {'; '.join(skipped_labels)}", flush=True)
+    if summary["render_failed_rollouts"]:
+        failed_labels = [
+            f"{entry['scene_id']}/rollout_{entry['rollout_id']}: {entry.get('error', '')}"
+            for entry in summary["render_failed_rollouts"]
+        ]
+        print(f"[WARN]   render failures: {'; '.join(failed_labels)}", flush=True)
+    print(f"[INFO]   summary file: {output_path}", flush=True)
+
+
+def _initialize_rendering_runtime() -> tuple[Any, Any, Any]:
     builder_module = _load_builder_module()
     sim_app = _create_sim_app()
     if sim_app is None:
@@ -1413,14 +1758,135 @@ def main() -> int:
         sim_app.update()
 
     sampler_module = _load_goal_sampler_module()
+    return builder_module, sim_app, sampler_module
+
+
+def _run_randomized_warehouse_batch(args: argparse.Namespace, camera_settings: CameraSettings) -> int:
+    discovery = _discover_randomized_warehouse_render_targets(
+        args.randomized_warehouse_root,
+        rollout_ids=args.rollout_ids,
+        overwrite=bool(args.overwrite),
+    )
+
+    rendered_rollouts: list[dict[str, Any]] = []
+    render_failed_rollouts: list[dict[str, Any]] = []
+    summary_path = discovery.root / "render_batch_summary.json"
+
+    if discovery.targets:
+        builder_module, sim_app, sampler_module = _initialize_rendering_runtime()
+        try:
+            for target in discovery.targets:
+                print(
+                    f"[INFO] Rendering {target.scene_id} rollout {target.rollout_id} "
+                    f"from {target.rollout_dir}...",
+                    flush=True,
+                )
+                try:
+                    rollout = load_rollout(target.rollout_dir)
+                    _render_rollout(
+                        sim_app,
+                        builder_module,
+                        sampler_module,
+                        rollout,
+                        camera_settings,
+                        overwrite=bool(args.overwrite),
+                    )
+                    rendered_rollouts.append(
+                        _summary_entry(
+                            target.scene_id,
+                            rollout_id=target.rollout_id,
+                            path=target.rollout_dir,
+                        )
+                    )
+                    print(
+                        f"[INFO] Finished {target.scene_id} rollout {target.rollout_id}. "
+                        f"RGB and depth images are stored under {target.rollout_dir}.",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    render_failed_rollouts.append(
+                        _summary_entry(
+                            target.scene_id,
+                            rollout_id=target.rollout_id,
+                            path=target.rollout_dir,
+                            error=str(exc),
+                        )
+                    )
+                    print(
+                        f"[ERROR] Failed rendering {target.scene_id} rollout "
+                        f"{target.rollout_id}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        finally:
+            sim_app.close()
+    else:
+        print("[WARN] No randomized warehouse rollouts were selected for rendering.", flush=True)
+
+    summary = _build_batch_summary(
+        discovery,
+        camera_config_path=args.camera_config,
+        overwrite=bool(args.overwrite),
+        rendered_rollouts=rendered_rollouts,
+        render_failed_rollouts=render_failed_rollouts,
+    )
+    _write_batch_summary(summary, summary_path)
+    _print_batch_summary(summary, summary_path)
+    return 1 if render_failed_rollouts else 0
+
+
+def main() -> int:
+    args = _parse_args()
+    try:
+        camera_settings = _load_camera_settings(args.camera_config)
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        print(f"RenderRolloutRGBD: {exc}", file=sys.stderr)
+        return 1
+
+    if args.randomized_warehouse_root:
+        try:
+            return _run_randomized_warehouse_batch(args, camera_settings)
+        except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+            print(f"RenderRolloutRGBD: {exc}", file=sys.stderr)
+            return 1
 
     try:
-        for rollout in rollouts:
+        rollouts = load_rollouts(args.experiments_root, rollout_ids=args.rollout_ids)
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        print(f"RenderRolloutRGBD: {exc}", file=sys.stderr)
+        return 1
+
+    renderable_rollouts: list[RolloutData] = []
+    for rollout in rollouts:
+        if _rollout_has_render_outputs(rollout.rollout_dir) and not args.overwrite:
+            print(
+                f"[INFO] Skipping rollout {rollout.rollout_id} because rendered RGB/depth "
+                f"outputs already exist under {rollout.rollout_dir}. Use --overwrite to rerender.",
+                flush=True,
+            )
+            continue
+        renderable_rollouts.append(rollout)
+
+    if not renderable_rollouts:
+        print("[WARN] No rollouts were selected for rendering.", flush=True)
+        return 0
+
+    builder_module, sim_app, sampler_module = _initialize_rendering_runtime()
+
+    try:
+        for rollout in renderable_rollouts:
             print(
                 f"[INFO] Rendering rollout {rollout.rollout_id} from {rollout.rollout_dir}...",
                 flush=True,
             )
-            _render_rollout(sim_app, builder_module, sampler_module, rollout, camera_settings)
+            _render_rollout(
+                sim_app,
+                builder_module,
+                sampler_module,
+                rollout,
+                camera_settings,
+                overwrite=bool(args.overwrite),
+            )
             print(
                 f"[INFO] Finished rollout {rollout.rollout_id}. RGB and depth images are stored under {rollout.rollout_dir}.",
                 flush=True,
