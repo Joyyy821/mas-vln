@@ -45,6 +45,9 @@ class BatchItem:
     rollout_id: int
 
 
+COMBINED_XY_OVERLAY_NAME = "combined_xy_overlay.png"
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -177,12 +180,18 @@ def build_single_rollout_launch_command(
         "overwrite_existing_rollout:=true",
     ]
     for key, value in launch_options.items():
+        if key == "save_traj_plot":
+            continue
         if value != "":
             command.append(f"{key}:={value}")
     return command
 
 
-def cleanup_successful_rollout_artifacts(rollout_dir: Path) -> tuple[int, int]:
+def cleanup_successful_rollout_artifacts(
+    rollout_dir: Path,
+    *,
+    preserve_combined_xy_overlay: bool = False,
+) -> tuple[int, int]:
     removed_files = 0
     for csv_path in sorted(rollout_dir.glob("mapf_timed_tracker_*.csv")):
         if csv_path.is_file():
@@ -192,8 +201,22 @@ def cleanup_successful_rollout_artifacts(rollout_dir: Path) -> tuple[int, int]:
     removed_directories = 0
     tracking_plots_dir = rollout_dir / "tracking_plots"
     if tracking_plots_dir.is_dir():
-        shutil.rmtree(tracking_plots_dir)
-        removed_directories += 1
+        if preserve_combined_xy_overlay:
+            for plot_path in sorted(tracking_plots_dir.iterdir()):
+                if plot_path.name == COMBINED_XY_OVERLAY_NAME and plot_path.is_file():
+                    continue
+                if plot_path.is_dir():
+                    shutil.rmtree(plot_path)
+                    removed_directories += 1
+                else:
+                    plot_path.unlink()
+                    removed_files += 1
+            if not any(tracking_plots_dir.iterdir()):
+                tracking_plots_dir.rmdir()
+                removed_directories += 1
+        else:
+            shutil.rmtree(tracking_plots_dir)
+            removed_directories += 1
     elif tracking_plots_dir.exists():
         tracking_plots_dir.unlink()
         removed_files += 1
@@ -219,6 +242,7 @@ class RandomizedWarehouseBatchRunner(Node):
         self.declare_parameter("execution_start_timeout_sec", 300.0)
         self.declare_parameter("retry_cooldown_sec", 2.0)
         self.declare_parameter("status_topic", "/mapf_base/plan_execution_status")
+        self.declare_parameter("save_traj_plot", False)
 
         self._scene_root_dir = str(self.get_parameter("scene_root_dir").value).strip()
         if not self._scene_root_dir:
@@ -243,6 +267,7 @@ class RandomizedWarehouseBatchRunner(Node):
             float(self.get_parameter("retry_cooldown_sec").value),
             0.0,
         )
+        self._save_traj_plot = _as_bool(self.get_parameter("save_traj_plot").value)
 
         self._launch_options = self._read_launch_options()
         scene_control_topic = str(self.get_parameter("scene_control_topic").value)
@@ -361,6 +386,8 @@ class RandomizedWarehouseBatchRunner(Node):
                 continue
             result = self._run_single_rollout_launch(item, attempt)
             if result == "succeeded":
+                if self._save_traj_plot:
+                    self._plot_successful_rollout(rollout_dir)
                 self._cleanup_successful_rollout(rollout_dir)
                 return True
             self.get_logger().warn(
@@ -466,12 +493,36 @@ class RandomizedWarehouseBatchRunner(Node):
             return
 
     def _plot_failed_rollout(self, rollout_dir: Path) -> None:
+        self._plot_rollout_tracking_logs(
+            rollout_dir,
+            combined_only=False,
+            missing_log_level="warn",
+        )
+
+    def _plot_successful_rollout(self, rollout_dir: Path) -> None:
+        self._plot_rollout_tracking_logs(
+            rollout_dir,
+            combined_only=True,
+            missing_log_level="info",
+        )
+
+    def _plot_rollout_tracking_logs(
+        self,
+        rollout_dir: Path,
+        *,
+        combined_only: bool,
+        missing_log_level: str,
+    ) -> None:
         if not rollout_dir.exists():
             self.get_logger().warn(f"No rollout directory exists to plot: {rollout_dir}")
             return
         csv_paths = sorted(rollout_dir.glob("mapf_timed_tracker_*.csv"))
         if not csv_paths:
-            self.get_logger().warn(f"No timed-tracker CSV logs found under {rollout_dir}.")
+            log_message = f"No timed-tracker CSV logs found under {rollout_dir}."
+            if missing_log_level == "info":
+                self.get_logger().info(log_message)
+            else:
+                self.get_logger().warn(log_message)
             return
         output_dir = rollout_dir / "tracking_plots"
         command = [
@@ -486,6 +537,8 @@ class RandomizedWarehouseBatchRunner(Node):
             str(output_dir),
             "--no-show",
         ]
+        if combined_only:
+            command.append("--combined-only")
         result = subprocess.run(command, check=False)
         if result.returncode != 0:
             self.get_logger().warn(
@@ -495,7 +548,10 @@ class RandomizedWarehouseBatchRunner(Node):
     def _cleanup_successful_rollout(self, rollout_dir: Path) -> None:
         if not rollout_dir.exists():
             return
-        removed_files, removed_directories = cleanup_successful_rollout_artifacts(rollout_dir)
+        removed_files, removed_directories = cleanup_successful_rollout_artifacts(
+            rollout_dir,
+            preserve_combined_xy_overlay=self._save_traj_plot,
+        )
         if removed_files or removed_directories:
             self.get_logger().info(
                 f"Cleaned successful rollout diagnostics under {rollout_dir}: "

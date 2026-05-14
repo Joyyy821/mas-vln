@@ -533,6 +533,11 @@ def main() -> int:
         action="store_true",
         help="Save plots without opening interactive windows.",
     )
+    parser.add_argument(
+        "--combined-only",
+        action="store_true",
+        help="Save only combined_xy_overlay.png and skip per-log diagnostic plots.",
+    )
     args = parser.parse_args()
 
     try:
@@ -552,10 +557,18 @@ def main() -> int:
     plt, headless = _import_matplotlib(force_headless=args.no_show)
     figures = []
 
-    for log in logs:
-        output_path, figure = _plot_single_log(log, output_dir, args.dpi, plt)
-        figures.append(figure)
-        print(f"Saved plot: {output_path}")
+    if args.combined_only and len(logs) < 2:
+        print(
+            "PlotMapfTrackingLogs: combined XY overlay requires at least two logs; "
+            f"got {len(logs)}. No plot was created."
+        )
+        return 0
+
+    if not args.combined_only:
+        for log in logs:
+            output_path, figure = _plot_single_log(log, output_dir, args.dpi, plt)
+            figures.append(figure)
+            print(f"Saved plot: {output_path}")
 
     combined_output_path, combined_figure = _plot_combined_xy(logs, output_dir, args.dpi, plt)
     if combined_output_path is not None:

@@ -390,8 +390,42 @@ class WarehouseRandomizedBuilderMetadataTests(unittest.TestCase):
         self.assertEqual(selected.prim_path, forklift_01.prim_path)
         self.assertEqual(debug["selector_id"], warehouse_builder_module.FOCUS_SELECTOR_ID)
         self.assertTrue(debug["selector_path"].endswith("forklift_near_shelf.py"))
-        self.assertEqual(debug["selected_reason"], "smallest_world_center_x")
+        self.assertEqual(
+            debug["selected_reason"],
+            "largest_x_separation_smallest_world_center_x",
+        )
+        self.assertEqual(debug["selection_rule"], "x_threshold_then_y_center")
+        self.assertEqual(debug["x_diff_threshold_m"], 1.0)
+        self.assertEqual(debug["target_y_center_m"], 2.0)
+        self.assertGreater(debug["x_span_m"], debug["x_diff_threshold_m"])
         self.assertEqual(debug["candidate_count"], 2)
+
+    def test_instruction_selector_uses_y_center_when_world_x_centers_are_close(self) -> None:
+        smaller_x_farther_y = ObjectBBox3D(
+            prim_path="/World/Env/Warehouse/Forklift",
+            min_xyz=np.array([1.0, -4.0, 0.0], dtype=float),
+            max_xyz=np.array([3.0, -2.0, 2.0], dtype=float),
+        )
+        larger_x_closer_y = ObjectBBox3D(
+            prim_path="/World/Env/Warehouse/Forklift_01",
+            min_xyz=np.array([1.5, 1.0, 0.0], dtype=float),
+            max_xyz=np.array([3.5, 3.0, 2.0], dtype=float),
+        )
+
+        selected, debug = select_focus_object([smaller_x_farther_y, larger_x_closer_y])
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.prim_path, larger_x_closer_y.prim_path)
+        self.assertEqual(
+            debug["selected_reason"],
+            "x_centers_close_closest_to_target_y_center",
+        )
+        self.assertLessEqual(debug["x_span_m"], debug["x_diff_threshold_m"])
+        self.assertEqual(debug["selected_delta_y_from_target_center_m"], 0.0)
+        self.assertEqual(
+            [candidate["delta_y_from_target_center_m"] for candidate in debug["candidates"]],
+            [5.0, 0.0],
+        )
 
     def test_resolve_focus_object_records_selector_debug(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

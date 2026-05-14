@@ -128,6 +128,7 @@ class RandomizedWarehouseBatchRunnerTests(unittest.TestCase):
                 launch_options={
                     "execution_backend": "timed_tracker",
                     "record_cmd_vel_topic_suffix": "cmd_vel",
+                    "save_traj_plot": "true",
                     "experiments_dir": "",
                 },
             )
@@ -138,6 +139,7 @@ class RandomizedWarehouseBatchRunnerTests(unittest.TestCase):
             self.assertIn("overwrite_existing_rollout:=true", command)
             self.assertIn("execution_backend:=timed_tracker", command)
             self.assertIn("record_cmd_vel_topic_suffix:=cmd_vel", command)
+            self.assertNotIn("save_traj_plot:=true", command)
 
     def test_success_cleanup_removes_tracker_diagnostics_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -166,6 +168,30 @@ class RandomizedWarehouseBatchRunnerTests(unittest.TestCase):
             self.assertFalse(plots_dir.exists())
             self.assertTrue(velocity_csv.is_file())
             self.assertTrue(run_config.is_file())
+
+    def test_success_cleanup_can_preserve_combined_xy_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rollout_dir = Path(tmpdir) / "rollout"
+            rollout_dir.mkdir()
+            tracker_csv = rollout_dir / "mapf_timed_tracker_pid123_exec001_nova_carter.csv"
+            tracker_csv.write_text("elapsed\n", encoding="utf-8")
+            plots_dir = rollout_dir / "tracking_plots"
+            plots_dir.mkdir()
+            combined_plot = plots_dir / "combined_xy_overlay.png"
+            combined_plot.write_text("combined\n", encoding="utf-8")
+            stale_agent_plot = plots_dir / "mapf_timed_tracker_pid123_exec001_nova_carter.png"
+            stale_agent_plot.write_text("agent\n", encoding="utf-8")
+
+            removed_files, removed_directories = batch_runner.cleanup_successful_rollout_artifacts(
+                rollout_dir,
+                preserve_combined_xy_overlay=True,
+            )
+
+            self.assertEqual(removed_files, 2)
+            self.assertEqual(removed_directories, 0)
+            self.assertFalse(tracker_csv.exists())
+            self.assertFalse(stale_agent_plot.exists())
+            self.assertTrue(combined_plot.is_file())
 
 
 if __name__ == "__main__":

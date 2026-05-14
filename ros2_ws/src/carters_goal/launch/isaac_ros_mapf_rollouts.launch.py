@@ -35,6 +35,7 @@ def generate_launch_description():
                 "execution_start_timeout_sec": LaunchConfiguration("execution_start_timeout_sec"),
                 "retry_cooldown_sec": LaunchConfiguration("retry_cooldown_sec"),
                 "status_topic": LaunchConfiguration("execution_status_topic"),
+                "save_traj_plot": LaunchConfiguration("save_traj_plot"),
                 "mapf_params_file": LaunchConfiguration("mapf_params_file"),
                 "mapf_costmap_params_file": LaunchConfiguration("mapf_costmap_params_file"),
                 "initial_pose_tf_params_file": LaunchConfiguration("initial_pose_tf_params_file"),
@@ -121,6 +122,14 @@ def generate_launch_description():
                 "retry_cooldown_sec",
                 default_value="2.0",
                 description="Seconds to pause after terminating one child launch attempt.",
+            ),
+            DeclareLaunchArgument(
+                "save_traj_plot",
+                default_value="false",
+                description=(
+                    "When true, save tracking_plots/combined_xy_overlay.png for successful "
+                    "rollouts before cleaning timed-tracker diagnostics."
+                ),
             ),
             DeclareLaunchArgument(
                 "mapf_params_file",

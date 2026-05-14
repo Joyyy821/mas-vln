@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import traceback
+from typing import Any
 
 import yaml
 
@@ -37,7 +38,7 @@ from isaac_sim.stage_bringups.warehouse_randomized.robot_teams import (  # noqa:
 
 DEFAULT_SCENE_ROOT_DIR = REPO_ROOT / "experiments" / "randomized_warehouse"
 DEFAULT_COLLECTION_LANGUAGE_INSTRUCTION = "go to the forklift near the shelf"
-DEFAULT_FOCUS_SELECTOR_ID = "forklift_near_shelf_min_world_x"
+DEFAULT_FOCUS_SELECTOR_ID = "forklift_near_shelf_x_threshold_then_y_center"
 DEFAULT_COLLECTION_METADATA_FILENAME = "collection_metadata.yaml"
 DEFAULT_RANDOMIZATION_STRENGTH = "balanced"
 DEFAULT_SCENES_PER_TEMPLATE = 5
@@ -125,6 +126,10 @@ def _write_collection_metadata(scene_root_dir: Path, language_instruction: str) 
 
 def _parse_robot_models(value: str) -> list[str]:
     return [token.strip() for token in str(value).split(",") if token.strip()]
+
+
+def _effective_builder_overwrite(*, overwrite: bool, spawn_robots_only: bool) -> bool:
+    return bool(overwrite) or bool(spawn_robots_only)
 
 
 def _template_sort_key(template_id: str) -> tuple[int, str]:
@@ -508,8 +513,8 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Load an existing scene bundle and spawn robots into the live stage without saving "
-            "them into scene.usd. Existing team_config.yaml is reused unless --overwrite is set; "
-            "missing/overwritten team configs are sampled from the existing scene maps."
+            "them into scene.usd. Existing team_config.yaml is regenerated so goal poses reflect "
+            "the current focus selector and scene maps."
         ),
     )
     parser.add_argument(
@@ -752,6 +757,100 @@ def _build_scene_bundle_with_retries(
     return None, sim_app, failure
 
 
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _candidate_center_xy(candidate: dict[str, Any]) -> tuple[float | None, float | None]:
+    center = candidate.get("center_xyz")
+    if center is None:
+        center = candidate.get("center")
+    if not isinstance(center, (list, tuple)) or len(center) < 2:
+        return None, None
+    return _optional_float(center[0]), _optional_float(center[1])
+
+
+def _format_optional_float(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.3f}"
+
+
+def _format_focus_selection_log_lines(focus_selection: dict[str, Any]) -> list[str]:
+    if not focus_selection:
+        return []
+
+    lines: list[str] = []
+    selector_id = str(focus_selection.get("selector_id", "") or "").strip()
+    selection_rule = str(focus_selection.get("selection_rule", "") or "").strip()
+    selected_reason = str(focus_selection.get("selected_reason", "") or "").strip()
+    selected_prim_path = str(focus_selection.get("selected_prim_path", "") or "").strip()
+    candidates = [
+        candidate
+        for candidate in focus_selection.get("candidates", [])
+        if isinstance(candidate, dict)
+    ]
+
+    x_values = [
+        center_x
+        for candidate in candidates
+        for center_x, _center_y in [_candidate_center_xy(candidate)]
+        if center_x is not None
+    ]
+    x_span = _optional_float(focus_selection.get("x_span_m"))
+    if x_span is None and x_values:
+        x_span = max(x_values) - min(x_values)
+    x_diff_threshold = _optional_float(focus_selection.get("x_diff_threshold_m"))
+    target_y_center = _optional_float(focus_selection.get("target_y_center_m"))
+
+    if selector_id:
+        lines.append(f"  focus_selector: {selector_id}")
+    if selection_rule:
+        lines.append(f"  focus_selection_rule: {selection_rule}")
+
+    x_span_line = f"  focus_x_span_m: {_format_optional_float(x_span)}"
+    if x_diff_threshold is not None:
+        x_span_line = f"{x_span_line} (threshold={x_diff_threshold:.3f})"
+    lines.append(x_span_line)
+    if x_values:
+        formatted_x_values = ", ".join(f"{value:.3f}" for value in sorted(x_values))
+        lines.append(f"  focus_center_x_values_m: [{formatted_x_values}]")
+    if target_y_center is not None:
+        lines.append(f"  focus_target_y_center_m: {target_y_center:.3f}")
+    if selected_reason:
+        lines.append(f"  focus_selected_reason: {selected_reason}")
+
+    if candidates:
+        lines.append("  focus_candidates:")
+        for candidate in candidates:
+            prim_path = str(candidate.get("prim_path", "") or "<unknown>")
+            center_x, center_y = _candidate_center_xy(candidate)
+            delta_y = _optional_float(candidate.get("delta_y_from_target_center_m"))
+            selected_marker = " [selected]" if prim_path == selected_prim_path else ""
+            lines.append(
+                "    - "
+                f"{prim_path}: "
+                f"center_x={_format_optional_float(center_x)}, "
+                f"center_y={_format_optional_float(center_y)}, "
+                f"delta_y_from_target_center={_format_optional_float(delta_y)}"
+                f"{selected_marker}"
+            )
+
+    return lines
+
+
+def _print_focus_selection_summary(result) -> None:
+    validation_summary = getattr(result, "validation_summary", {}) or {}
+    if not isinstance(validation_summary, dict):
+        return
+    focus_selection = validation_summary.get("focus_selection", {}) or {}
+    if not isinstance(focus_selection, dict):
+        return
+    for line in _format_focus_selection_log_lines(focus_selection):
+        print(line, flush=True)
+
+
 def _print_bundle_result(result) -> None:
     print("[OK] Randomized warehouse scene bundle created.", flush=True)
     print(f"  scene_id: {result.scene_id}", flush=True)
@@ -767,6 +866,7 @@ def _print_bundle_result(result) -> None:
         print(f"  team_config: skipped", flush=True)
     print(f"  nav2_map: {result.nav2_map_path}", flush=True)
     print(f"  mapf_map: {result.mapf_map_path}", flush=True)
+    _print_focus_selection_summary(result)
     if has_team_config:
         print(
             "  ros_launch_hint: "
@@ -876,6 +976,15 @@ def main() -> int:
     requested_headless = bool(args.headless) if args.headless is not None else not run_sim
     base_seed = int(args.seed) if args.seed is not None else int(time.time_ns() % (2**31 - 1))
     robot_models = _parse_robot_models(args.robot_models)
+    effective_builder_overwrite = _effective_builder_overwrite(
+        overwrite=bool(args.overwrite),
+        spawn_robots_only=bool(args.spawn_robots_only),
+    )
+    if args.spawn_robots_only and not args.overwrite:
+        print(
+            "[INFO] --spawn-robots-only will regenerate team_config.yaml for selected scenes.",
+            flush=True,
+        )
 
     try:
         bundle_specs = select_bundle_specs_for_run(
@@ -887,7 +996,7 @@ def main() -> int:
             base_seed=base_seed,
             randomization_strength=selected_randomization_strength,
             scenes_per_template=int(args.scenes_per_template),
-            overwrite=bool(args.overwrite) or bool(args.spawn_robots_only),
+            overwrite=effective_builder_overwrite,
         )
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
@@ -948,7 +1057,7 @@ def main() -> int:
                 enable_ros2_runtime=bool(args.enable_ros2_runtime) and keep_sim_running,
                 rollout_control_topic=args.rollout_control_topic,
                 rollout_reset_done_topic=args.rollout_reset_done_topic,
-                overwrite=bool(args.overwrite),
+                overwrite=effective_builder_overwrite,
                 headless=shared_headless,
                 keep_sim_running=keep_sim_running,
                 sim_app=shared_sim_app,

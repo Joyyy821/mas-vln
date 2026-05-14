@@ -188,6 +188,26 @@ class BuildStageWarehouseRandomizedTests(unittest.TestCase):
                 base_only=False,
             )
 
+    def test_effective_builder_overwrite_refreshes_spawn_robots_only_team_config(self) -> None:
+        self.assertFalse(
+            warehouse_cli._effective_builder_overwrite(
+                overwrite=False,
+                spawn_robots_only=False,
+            )
+        )
+        self.assertTrue(
+            warehouse_cli._effective_builder_overwrite(
+                overwrite=False,
+                spawn_robots_only=True,
+            )
+        )
+        self.assertTrue(
+            warehouse_cli._effective_builder_overwrite(
+                overwrite=True,
+                spawn_robots_only=False,
+            )
+        )
+
     def test_derive_bundle_seed_is_stable_and_variant_specific(self) -> None:
         first_seed = warehouse_cli._derive_bundle_seed(42, "1", "balanced")
         second_seed = warehouse_cli._derive_bundle_seed(42, "1", "balanced")
@@ -304,6 +324,61 @@ class BuildStageWarehouseRandomizedTests(unittest.TestCase):
         self.assertEqual(payload["language_instruction"], "go to the forklift near the shelf")
         self.assertEqual(payload["focus_selector"], warehouse_cli.DEFAULT_FOCUS_SELECTOR_ID)
         self.assertEqual(payload["robot_team_mode"], warehouse_cli.DEFAULT_ROBOT_TEAM_MODE)
+
+    def test_focus_selection_log_lines_report_threshold_span_and_candidates(self) -> None:
+        lines = warehouse_cli._format_focus_selection_log_lines(
+            {
+                "selector_id": "forklift_near_shelf_x_threshold_then_y_center",
+                "selection_rule": "min_x_or_y_center",
+                "x_diff_threshold_m": 1.0,
+                "target_y_center_m": 2.0,
+                "x_span_m": 0.8,
+                "selected_reason": "x_span_within_threshold_select_min_delta_y",
+                "selected_prim_path": "/World/Forklift_B",
+                "candidates": [
+                    {
+                        "prim_path": "/World/Forklift_A",
+                        "center_xyz": [1.0, -3.0, 0.0],
+                        "delta_y_from_target_center_m": 5.0,
+                    },
+                    {
+                        "prim_path": "/World/Forklift_B",
+                        "center_xyz": [1.8, 2.1, 0.0],
+                        "delta_y_from_target_center_m": 0.1,
+                    },
+                ],
+            }
+        )
+
+        joined = "\n".join(lines)
+        self.assertIn("focus_x_span_m: 0.800 (threshold=1.000)", joined)
+        self.assertIn("focus_center_x_values_m: [1.000, 1.800]", joined)
+        self.assertIn("focus_target_y_center_m: 2.000", joined)
+        self.assertIn("center_x=1.800, center_y=2.100", joined)
+        self.assertIn("/World/Forklift_B", joined)
+        self.assertIn("[selected]", joined)
+
+    def test_focus_selection_log_lines_compute_x_span_for_legacy_payload(self) -> None:
+        lines = warehouse_cli._format_focus_selection_log_lines(
+            {
+                "selector_id": "forklift_near_shelf_min_world_x",
+                "selected_prim_path": "/World/Forklift_A",
+                "candidates": [
+                    {
+                        "prim_path": "/World/Forklift_A",
+                        "center_xyz": [-5.0, 2.0, 0.0],
+                    },
+                    {
+                        "prim_path": "/World/Forklift_B",
+                        "center_xyz": [2.0, 2.2, 0.0],
+                    },
+                ],
+            }
+        )
+
+        joined = "\n".join(lines)
+        self.assertIn("focus_x_span_m: 7.000", joined)
+        self.assertIn("focus_center_x_values_m: [-5.000, 2.000]", joined)
 
     def test_write_and_load_collection_metadata_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
